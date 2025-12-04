@@ -1,0 +1,268 @@
+#!/usr/bin/env bash
+# wwpn-to-node
+# Given a Fibre Channel WWPN, find which OpenShift WORKER node has it.
+#
+# - Searches only nodes labeled node-role.kubernetes.io/worker
+# - Uses: oc debug node/<name> -- chroot /host ...
+# - Compares WWPNs case-insensitively, ignoring colons and leading 0x
+# - Parallelism: --parallel N  (default 4)
+# - Per-node timeout via FC_TIMEOUT env var (default 60)
+#
+# Behavior:
+#   * All worker nodes scanned in parallel (up to N at a time)
+#   * After all results return, first matching node (in original order)
+#     is selected.
+#   * Output includes ALL WWPNs from that node, in:
+#         WWPN:<normalized> or <colon-format>
+#
+# Example colon output:
+#       WWPN:2001abcdef012350 or 20:01:ab:cd:ef:01:23:50
+
+set -u  # avoid -e to allow node-by-node failure handling
+
+usage() {
+  cat <<'USAGE'
+Usage:
+  wwpn-to-node <wwpn> [--parallel N]
+
+Examples:
+  wwpn-to-node 10:00:00:10:9b:aa:9c:fc
+  wwpn-to-node 100000109baa9cfc
+  wwpn-to-node 0x100000109baa9cfc
+  wwpn-to-node 10:00:00:10:9b:aa:9c:fc --parallel 8
+
+Notes:
+  - Only searches worker nodes (node-role.kubernetes.io/worker)
+  - Uses oc debug + chroot /host to read /sys/class/fc_host
+  - WWPN comparison:
+      * lowercased
+      * colons removed
+      * leading 0x stripped
+  - Per-node timeout via FC_TIMEOUT (default 60)
+USAGE
+}
+
+normalize_wwpn() {
+  local s="$1"
+  s=$(echo "$s" | tr 'A-Z' 'a-z')
+  s="${s//:/}"
+  s="${s#0x}"
+  echo "$s"
+}
+
+colonize_wwpn() {
+  # Convert "2001abcdef012350" => "20:01:ab:cd:ef:01:23:50"
+  local w="$1"
+  echo "$w" | sed 's/../&:/g; s/:$//'
+}
+
+if (( $# < 1 )); then
+  usage
+  exit 1
+fi
+
+WWPN_RAW=""
+PARALLEL=4  # default
+
+# argument parser
+while (( $# > 0 )); do
+  case "$1" in
+    --parallel)
+      if (( $# < 2 )); then
+        echo "ERROR: --parallel requires a number." >&2
+        exit 1
+      fi
+      PARALLEL="$2"
+      shift 2
+      ;;
+    -h|--help)
+      usage
+      exit 0
+      ;;
+    *)
+      if [[ -z "$WWPN_RAW" ]]; then
+        WWPN_RAW="$1"
+        shift
+      else
+        echo "ERROR: Unexpected argument: $1" >&2
+        usage
+        exit 1
+      fi
+      ;;
+  esac
+done
+
+if [[ -z "$WWPN_RAW" ]]; then
+  echo "ERROR: WWPN is required." >&2
+  usage
+  exit 1
+fi
+
+if ! [[ "$PARALLEL" =~ ^[0-9]+$ ]]; then
+  echo "WARN: invalid --parallel '$PARALLEL', defaulting to 4." >&2
+  PARALLEL=4
+fi
+(( PARALLEL < 1 )) && PARALLEL=1
+
+TARGET_WWPN="$(normalize_wwpn "$WWPN_RAW")"
+
+if ! command -v oc >/dev/null 2>&1; then
+  echo "ERROR: oc not found in PATH." >&2
+  exit 2
+fi
+if ! oc whoami >/dev/null 2>&1; then
+  echo "ERROR: Not logged into OpenShift." >&2
+  exit 2
+fi
+
+# worker nodes
+NODES=$(oc get nodes -l node-role.kubernetes.io/worker \
+          -o jsonpath='{range .items[*]}{.metadata.name}{"\n"}{end}')
+
+if [[ -z "$NODES" ]]; then
+  echo "ERROR: No worker nodes found." >&2
+  exit 2
+fi
+
+NODES_ARR=()
+while IFS= read -r n; do
+  [[ -z "$n" ]] && continue
+  NODES_ARR+=("$n")
+done <<< "$NODES"
+
+FC_TIMEOUT="${FC_TIMEOUT:-60}"
+if ! [[ "$FC_TIMEOUT" =~ ^[0-9]+$ ]]; then
+  FC_TIMEOUT=60
+fi
+(( FC_TIMEOUT < 1 )) && FC_TIMEOUT=60
+
+echo "Searching worker nodes for WWPN: $TARGET_WWPN"
+echo "Worker nodes to check:"
+for n in "${NODES_ARR[@]}"; do
+  echo "  - $n"
+done
+echo
+
+# temp dir for collected results
+tmpdir="$(mktemp -d)"
+pids=()
+
+##############################################
+# Per-node scan function (runs in background)
+##############################################
+scan_node() {
+  local node="$1"
+  local target="$2"
+  local timeout_sec="$3"
+  local outdir="$4"
+
+  local timeout_cmd=()
+  if command -v timeout >/dev/null 2>&1; then
+    timeout_cmd=(timeout "$timeout_sec")
+  fi
+
+  local raw
+  raw="$(
+    "${timeout_cmd[@]}" oc debug "node/$node" --quiet -- \
+      chroot /host /bin/bash -c '
+        shopt -s nullglob
+        for f in /sys/class/fc_host/host*/port_name; do
+          cat "$f" 2>/dev/null
+          echo
+        done
+      ' 2>/dev/null
+  )"
+  local rc=$?
+
+  local outfile="$outdir/$node"
+
+  if (( rc != 0 )); then
+    echo "ERROR_TIMEOUT_OR_DEBUG" > "$outfile"
+    return
+  fi
+
+  # normalize output
+  local norm_list
+  norm_list="$(
+    printf '%s\n' "$raw" \
+      | tr 'A-Z' 'a-z' \
+      | sed 's/^0x//' \
+      | sed 's/://g' \
+      | tr -d '\r' \
+      | sed '/^$/d'
+  )"
+
+  if [[ -z "$norm_list" ]]; then
+    echo "NO_FC" > "$outfile"
+    return
+  fi
+
+  # match?
+  if printf '%s\n' "$norm_list" | grep -qx "$target"; then
+    {
+      echo "MATCH"
+      printf '%s\n' "$norm_list"
+    } > "$outfile"
+  else
+    echo "NO_MATCH" > "$outfile"
+  fi
+}
+
+##############################################
+# Launch parallel scans
+##############################################
+for NODE in "${NODES_ARR[@]}"; do
+  (
+    scan_node "$NODE" "$TARGET_WWPN" "$FC_TIMEOUT" "$tmpdir"
+  ) &
+  pids+=( "$!" )
+
+  if (( ${#pids[@]} >= PARALLEL )); then
+    wait "${pids[0]}" 2>/dev/null || true
+    pids=( "${pids[@]:1}" )
+  fi
+done
+
+# Final waits
+for pid in "${pids[@]}"; do
+  wait "$pid" 2>/dev/null || true
+done
+
+##############################################
+# Aggregate: find FIRST matching node
+##############################################
+found_node=""
+found_wppns=""
+
+for NODE in "${NODES_ARR[@]}"; do
+  outfile="$tmpdir/$NODE"
+  [[ -f "$outfile" ]] || continue
+
+  first_line="$(head -n1 "$outfile")"
+
+  if [[ "$first_line" == "MATCH" ]]; then
+    found_node="$NODE"
+    found_wppns="$(tail -n +2 "$outfile")"
+    break
+  fi
+done
+
+rm -rf "$tmpdir"
+
+##############################################
+# Output results
+##############################################
+if [[ -n "$found_node" ]]; then
+  echo "✅ WWPN:${TARGET_WWPN} found on node ${found_node}:"
+  while IFS= read -r w; do
+    [[ -z "$w" ]] && continue
+    col="$(colonize_wwpn "$w")"
+    echo "WWPN:${w} or ${col}"
+  done <<< "$found_wppns"
+  echo
+  exit 0
+fi
+
+# no match
+echo "❌ No worker node found with WWPN: $TARGET_WWPN"
+exit 1

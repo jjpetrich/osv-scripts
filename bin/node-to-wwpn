@@ -1,0 +1,117 @@
+#!/usr/bin/env bash
+# node-to-wwpn.sh
+# Show Fibre Channel WWPNs (and related info) for a specific OpenShift node.
+
+set -euo pipefail
+
+usage() {
+  cat <<'USAGE'
+Usage:
+  oc-fc-wwpns.sh <node-name> [--raw]
+
+Examples:
+  oc-fc-wwpns.sh worker-2.example.com
+  oc-fc-wwpns.sh ip-10-0-54-123.ec2.internal --raw   # only WWPNs
+
+Notes:
+  - Requires: oc (logged in with permissions to run 'oc debug node/...').
+  - This runs a transient debug pod and chroots into the host.
+USAGE
+}
+
+if [[ $# -lt 1 || $# -gt 2 ]]; then
+  usage; exit 1
+fi
+
+NODE="$1"
+RAW="${2:-}"
+
+if ! command -v oc >/dev/null 2>&1; then
+  echo "ERROR: 'oc' not found in PATH." >&2
+  exit 2
+fi
+
+# Sanity checks
+if ! oc whoami >/dev/null 2>&1; then
+  echo "ERROR: Not logged into a cluster. Run 'oc login' first." >&2
+  exit 2
+fi
+
+if ! oc get node "$NODE" >/dev/null 2>&1; then
+  echo "ERROR: Node '$NODE' not found." >&2
+  exit 3
+fi
+
+# The payload we want to run on the host
+read -r -d '' REMOTE_SCRIPT <<'EOS' || true
+set -euo pipefail
+
+shopt -s nullglob
+
+hosts=(/sys/class/fc_host/host*)
+if (( ${#hosts[@]} == 0 )); then
+  echo "No Fibre Channel HBAs detected on this node."
+  exit 0
+fi
+
+if [[ "${RAW_MODE:-0}" == "1" ]]; then
+  # Print just the WWPNs (port_name) one per line
+  for h in "${hosts[@]}"; do
+    if [[ -r "$h/port_name" ]]; then
+      # Normalize to lowercase without 0x prefix
+      p=$(tr 'A-Z' 'a-z' < "$h/port_name")
+      p=${p#0x}
+      echo "$p"
+    fi
+  done
+  exit 0
+fi
+
+printf "%-8s %-16s %-16s %-12s %-10s %-10s %-12s %-8s %s\n" \
+  "HOST" "WWPN(port)" "WWNN(node)" "STATE" "SPEED" "FABRIC" "PCI" "DRIVER" "SYMBOLIC_NAME"
+
+for h in "${hosts[@]}"; do
+  host=$(basename "$h")
+
+  rd() { [[ -r "$1" ]] && tr -d '\n' < "$1" || echo "-"; }
+
+  port_name=$(rd "$h/port_name"); port_name=${port_name#0x}
+  node_name=$(rd "$h/node_name"); node_name=${node_name#0x}
+  port_state=$(rd "$h/port_state")
+  speed=$(rd "$h/speed")
+  fabric_name=$(rd "$h/fabric_name"); fabric_name=${fabric_name#0x}
+  symbolic_name=$(rd "$h/symbolic_name")
+
+  # Resolve PCI address and driver
+  devpath=$(readlink -f "$h/device" || true)
+  # Walk up until we hit a PCI-like path (0000:xx:yy.z)
+  pci="-"; driver="-"
+  cur="$devpath"
+  while [[ -n "$cur" && "$cur" != "/" ]]; do
+    base=$(basename "$cur")
+    if [[ "$base" =~ ^[0-9a-f]{4}:[0-9a-f]{2}:[0-9a-f]{2}\.[0-9a-f]$ ]]; then
+      pci="$base"
+      [[ -L "$cur/driver" ]] && driver=$(basename "$(readlink -f "$cur/driver")")
+      break
+    fi
+    cur=$(dirname "$cur")
+  done
+
+  printf "%-8s %-16s %-16s %-12s %-10s %-10s %-12s %-8s %s\n" \
+    "$host" "$port_name" "$node_name" "$port_state" "$speed" "$fabric_name" "$pci" "$driver" "$symbolic_name"
+done
+EOS
+
+# Run the remote script on the node through oc debug -> chroot /host
+if [[ "$RAW" == "--raw" ]]; then
+  oc debug "node/${NODE}" --quiet -- bash -c \
+    "chroot /host /bin/bash -s <<'INNERSH' 
+export RAW_MODE=1
+$REMOTE_SCRIPT
+INNERSH"
+else
+  oc debug "node/${NODE}" --quiet -- bash -c \
+    "chroot /host /bin/bash -s <<'INNERSH' 
+$REMOTE_SCRIPT
+INNERSH"
+fi

@@ -1,0 +1,89 @@
+#!/usr/bin/env bash
+# fc-tools: Fibre Channel helper wrapper for OpenShift
+#
+# This script is a thin wrapper around two known-good scripts:
+#   - node-to-wwpn  (your original "node-to-wwpn.sh")
+#   - wwpn-to-node  (your original "wwpn-to-node.sh")
+#
+# It does NOT reimplement their logic; it only dispatches to them so we
+# don't regress any of the working behavior.
+#
+# Usage:
+#   fc-tools node-to-wwpn <node> [--raw]
+#   fc-tools wwpn-to-node <wwpn>
+#   fc-tools help
+
+set -u
+
+usage() {
+  cat <<'USAGE'
+Usage:
+  fc-tools <command> [args...]
+
+Commands:
+  node-to-wwpn <node-name> [--raw]
+      Call the existing 'node-to-wwpn' script to show FC HBAs and WWPNs
+      for a specific node. This is a thin wrapper; all behavior is
+      controlled by your original script.
+
+  wwpn-to-node <wwpn>
+      Call the existing 'wwpn-to-node' script to search worker nodes for
+      the given WWPN. Again, this is just a wrapper around your original
+      script.
+
+  help
+      Show this help text.
+
+Examples:
+  fc-tools node-to-wwpn radium08.byu.edu
+  fc-tools node-to-wwpn radium08.byu.edu --raw
+
+  fc-tools wwpn-to-node 10:00:00:10:9b:aa:9c:fc
+  fc-tools wwpn-to-node 100000109baa9cfc
+USAGE
+}
+
+require_cmd() {
+  local name="$1"
+  if ! command -v "$name" >/dev/null 2>&1; then
+    echo "ERROR: Required command '$name' not found in PATH." >&2
+    echo "       Make sure your original script '$name' is installed and executable." >&2
+    exit 2
+  fi
+}
+
+main() {
+  if (( $# == 0 )); then
+    usage
+    exit 1
+  fi
+
+  local cmd="$1"
+  shift || true
+
+  case "$cmd" in
+    node-to-wwpn)
+      # Delegate to your existing node-to-wwpn script
+      require_cmd node-to-wwpn
+      exec node-to-wwpn "$@"
+      ;;
+
+    wwpn-to-node)
+      # Delegate to your existing wwpn-to-node script
+      require_cmd wwpn-to-node
+      exec wwpn-to-node "$@"
+      ;;
+
+    help|-h|--help)
+      usage
+      ;;
+
+    *)
+      echo "Unknown command: $cmd" >&2
+      usage >&2
+      exit 1
+      ;;
+  esac
+}
+
+main "$@"
