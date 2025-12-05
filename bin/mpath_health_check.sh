@@ -2,6 +2,7 @@
 #
 # mpath_health_check.sh
 #
+# ***WARNING*** Use at your own risk. Script is intentionally conservative. ***WARNING***
 # Vendor-aware multipath health checker & optional cleaner for OpenShift nodes.
 #
 # Features:
@@ -12,6 +13,7 @@
 #       * Skips WWIDs that appear in any PV.
 #       * Verifies no mounts / open files before cleanup.
 #   - Cleanup is opt-in, per vendor & type, with DRY_RUN defaulting to true.
+#   - Optional --showvolume flag to attempt array-side volume lookup (HPE / Dell).
 #
 # Environment knobs:
 #   DRY_RUN                        (default: true)
@@ -23,12 +25,17 @@
 #   CLEANUP_HPE_ZERO_SIZE          (default: false)
 #   CLEANUP_HPE_ALL_PATHS_FAILED   (default: false)
 #
+#   SHOW_VOLUME                    (default: false; overridden by --showvolume)
+#
+#   PRIMERA_SSH                    (optional; e.g. "user@primera-mgmt" for remote showvv/showvlun)
+#   POWERSTORE_SSH                 (optional; e.g. "user@powerstore-mgmt" for custom lookup)
+#
 # Vendor classification:
 #   - "DellEMC,PowerStore"      => vendor_class = DELL
 #   - "3PARdata", "HPE,..."     => vendor_class = HPE
 #   - everything else           => vendor_class = OTHER
 #
-# Use at your own risk. Script is intentionally conservative.
+# ***WARNING*** Use at your own risk. Script is intentionally conservative. ***WARNING***
 
 set -euo pipefail
 
@@ -45,8 +52,17 @@ CLEANUP_DELL_ALL_PATHS_FAILED="${CLEANUP_DELL_ALL_PATHS_FAILED:-false}"
 CLEANUP_HPE_ZERO_SIZE="${CLEANUP_HPE_ZERO_SIZE:-false}"
 CLEANUP_HPE_ALL_PATHS_FAILED="${CLEANUP_HPE_ALL_PATHS_FAILED:-false}"
 
+# Optional: show array volume mapping when suspicious WWIDs are found
+SHOW_VOLUME="${SHOW_VOLUME:-false}"
+
 # Image used for oc debug (something with /bin/sh, multipath, lsof, etc. via host)
 DEBUG_IMAGE="${DEBUG_IMAGE:-registry.access.redhat.com/ubi9/ubi-minimal}"
+
+# PV WWID index:
+#   PV_WWID_INDEX[wwid] = 1
+#   PV_WWID_PVS[wwid]   = "pv1 pv2 ..."
+declare -A PV_WWID_INDEX
+declare -A PV_WWID_PVS
 
 # -----------------------------------------------------------------------------
 
@@ -69,11 +85,43 @@ get_nodes() {
   fi
 }
 
+# Build an index of WWIDs that appear in any PV (by scanning oc get pv -o wide)
 build_pv_wwid_index() {
   log "Building PV WWID index from all PVs..."
-  # Naive: scan for WWID-looking tokens (36... hex). You can tighten this if needed.
-  oc get pv -A -o wide | awk 'NR>1 {for (i=1;i<=NF;i++) print $i}' | \
-    grep -E '^36[0-9a-fA-F]+' | sort -u || true
+  PV_WWID_INDEX=()
+  PV_WWID_PVS=()
+
+  local line pv tok
+
+  while IFS= read -r line; do
+    [[ -z "$line" ]] && continue
+    # Skip header line
+    [[ "$line" =~ ^NAME[[:space:]] ]] && continue
+
+    # First column is PV name
+    pv=$(awk '{print $1}' <<<"$line")
+
+    # Scan all tokens on the line for WWID-looking strings
+    for tok in $line; do
+      if [[ "$tok" =~ ^36[0-9a-fA-F]+$ ]]; then
+        PV_WWID_INDEX["$tok"]=1
+        PV_WWID_PVS["$tok"]+="$pv "
+      fi
+    done
+  done < <(oc get pv -A -o wide)
+
+  local count=${#PV_WWID_INDEX[@]}
+  log "PV WWID index contains $count unique WWIDs"
+  if (( count > 0 )); then
+    for wwid in "${!PV_WWID_INDEX[@]}"; do
+      log "  WWID $wwid referenced by PV(s): ${PV_WWID_PVS[$wwid]}"
+    done
+  fi
+}
+
+wwid_in_pv_index() {
+  local wwid="$1"
+  [[ -n "${PV_WWID_INDEX[$wwid]:-}" ]]
 }
 
 # Classify vendor based on the "vendor,product" token from multipath -ll
@@ -94,6 +142,77 @@ classify_vendor() {
   esac
 
   echo "$vendor_class"
+}
+
+# Optional: attempt to show array-side volume info for a suspicious WWID
+show_volume_mapping() {
+  local vendor_class="$1"   # "HPE" or "DELL"
+  local wwid="$2"
+
+  log "  (--showvolume) Looking up volume details for WWID=$wwid (CLASS=$vendor_class)"
+
+  case "$vendor_class" in
+    HPE)
+      # HPE Primera/3PAR volume lookup
+      if command -v showvv >/dev/null 2>&1; then
+        log "    HPE: using local showvv/showvlun to find matching volume"
+
+        # showvv Name,WWN listing, then grep for the WWID
+        showvv -showcols Name,WWN -nohdtot 2>/dev/null | \
+          awk -v tgt="$wwid" '
+            index($2, tgt) > 0 {
+              printf("    showvv: volume=%s WWN=%s\n", $1, $2)
+            }
+          ' || true
+
+        # Optionally, showvlun mapping; this may not include the WWID directly,
+        # but if it does, this will surface it.
+        showvlun -showcols Name,Host_WWN,Host_Name -nohdtot 2>/dev/null | \
+          awk -v tgt="$wwid" '
+            index($0, tgt) > 0 {
+              printf("    showvlun: volume=%s host=%s host_wwn=%s\n", $1, $3, $2)
+            }
+          ' || true
+
+      elif [[ -n "${PRIMERA_SSH:-}" ]]; then
+        log "    HPE: using ssh $PRIMERA_SSH to query showvv/showvlun"
+
+        ssh "$PRIMERA_SSH" "showvv -showcols Name,WWN -nohdtot 2>/dev/null | grep $wwid" 2>/dev/null || true | \
+          sed 's/^/    showvv (remote): /' || true
+
+        ssh "$PRIMERA_SSH" "showvlun -showcols Name,Host_WWN,Host_Name -nohdtot 2>/dev/null | grep $wwid" 2>/dev/null || true | \
+          sed 's/^/    showvlun (remote): /' || true
+      else
+        log "    HPE: no local showvv CLI or PRIMERA_SSH configured; skipping volume lookup"
+      fi
+      ;;
+
+    DELL)
+      # Dell PowerStore volume lookup hook.
+      # Customize this with whatever CLI/API you have via ssh.
+      if [[ -n "${POWERSTORE_SSH:-}" ]]; then
+        log "    Dell: using ssh $POWERSTORE_SSH to query volume mapping (customize this section)"
+        # Example placeholder; replace "your-powerstore-command" with real tooling.
+        local out
+        #out=$(ssh "$POWERSTORE_SSH" "your-powerstore-command | grep -i $wwid" 2>/dev/null || true)
+        out=$(ssh "$POWERSTORE_SSH" "pstcli -query volume -type block | grep -i $wwid" 2>/dev/null || true)
+        if [[ -n "$out" ]]; then
+          while IFS= read -r line; do
+            [[ -z "$line" ]] && continue
+            log "    powerstore: $line"
+          done <<<"$out"
+        else
+          log "    powerstore: no matches found (or command not yet customized)"
+        fi
+      else
+        log "    Dell: no POWERSTORE_SSH configured; add a custom lookup if desired"
+      fi
+      ;;
+
+    *)
+      log "    No array lookup implemented for CLASS=$vendor_class"
+      ;;
+  esac
 }
 
 # Decide if we should attempt cleanup for this vendor_class + type
@@ -202,7 +321,7 @@ detect_bad_on_node() {
       if (state != "") {
           total_paths++
 
-          # DEBUG: send path lines to stderr so we can see what we matched
+          # DEBUG: uncomment if you want to see path parsing again
           #printf("DEBUG_PATH ww=%s state=%s detail=%s line=\"", wwid, state, detail) > "/dev/stderr"
           #for (i = 1; i <= NF; i++) {
           #    printf("%s%s", (i>1 ? " " : ""), $i) > "/dev/stderr"
@@ -278,9 +397,24 @@ EOF
 }
 
 main() {
+  # Simple CLI flag parser (currently only --showvolume)
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      --showvolume|--showvolumes)
+        SHOW_VOLUME=true
+        shift
+        ;;
+      *)
+        log "Unknown argument: $1 (ignored)"
+        shift
+        ;;
+    esac
+  done
+
   log "Starting multipath health check"
   log "DRY_RUN=${DRY_RUN}"
   [[ -n "$NODE_FILTER" ]] && log "NODE_FILTER=$NODE_FILTER"
+  log "SHOW_VOLUME=${SHOW_VOLUME}"
 
   log "Cleanup policy:"
   log "  DELL ZERO_SIZE       : ${CLEANUP_DELL_ZERO_SIZE}"
@@ -293,14 +427,8 @@ main() {
   local nodes
   nodes=$(get_nodes)
 
-  local pv_wwids
-  pv_wwids=$(build_pv_wwid_index)
-
-  log "PV WWID index contains $(echo "$pv_wwids" | wc -l | awk '{print $1}') unique WWIDs"
-
-  local pv_wwids_file
-  pv_wwids_file=$(mktemp)
-  echo "$pv_wwids" > "$pv_wwids_file"
+  # Build WWID -> PV index
+  build_pv_wwid_index
 
   while read -r node; do
     [ -z "$node" ] && continue
@@ -324,8 +452,13 @@ main() {
 
       log "[$nodename] Found $type WWID=$wwid VENDOR=\"$raw_vendor\" CLASS=$vendor_class"
 
+      # Optional: show array-side info
+      if [[ "$SHOW_VOLUME" == "true" ]]; then
+        show_volume_mapping "$vendor_class" "$wwid"
+      fi
+
       # Always skip if WWID appears in any PV definition
-      if grep -q "$wwid" "$pv_wwids_file"; then
+      if wwid_in_pv_index "$wwid"; then
         log "[$nodename]   Skipping $wwid because it appears in PV definitions"
         continue
       fi
@@ -342,8 +475,6 @@ main() {
     done
 
   done <<< "$nodes"
-
-  rm -f "$pv_wwids_file"
 
   log "Done."
 }

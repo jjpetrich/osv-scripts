@@ -1,16 +1,16 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-migatcher.py — Watch Konveyor/MTV migrations with deep detail & CDI progress fallback.
+migwatcher.py — Watch Konveyor/MTV migrations with deep detail & CDI progress fallback.
 
 Usage:
   python3 watch_migration.py [--ns openshift-mtv] [--interval 40] [--style pretty|table]
                              [--errors-only] [--show-events] [PLAN ...]
 Examples:
-  python3 migatcher.py
-  python3 migatcher.py --style table
-  python3 migatcher.py --errors-only PLAN_A PLAN_B
-  NS=openshift-mtv INTERVAL=40 STYLE=pretty SHOW_EVENTS=1 python3 migatcher.py
+  python3 migwatcher.py
+  python3 migwatcher.py --style table
+  python3 migwatcher.py --errors-only PLAN_A PLAN_B
+  NS=openshift-mtv INTERVAL=40 STYLE=pretty SHOW_EVENTS=1 python3 migwatcher.py
 
 Requires:
   - Python 3.8+
@@ -200,6 +200,21 @@ def index_plans_target_ns(all_items: List[Dict[str, Any]]) -> Dict[str, str]:
             m[name] = tgt
     return m
 
+
+def index_plans_warm(all_items: List[Dict[str, Any]]) -> Dict[str, bool]:
+    """Return a map of plan name -> True/False for spec.warm (Warm vs Cold)."""
+    m: Dict[str, bool] = {}
+    for it in all_items:
+        if it.get("kind") != "Plan":
+            continue
+        name = it.get("metadata", {}).get("name")
+        if not name:
+            continue
+        warm = it.get("spec", {}).get("warm")
+        # Treat explicit True as warm, everything else as cold
+        m[name] = bool(warm)
+    return m
+
 def latest_migrations_by_plan(all_items: List[Dict[str, Any]], plan_filter: List[str]) -> List[Dict[str, Any]]:
     # group by spec.plan.name and take latest by metadata.creationTimestamp
     by_plan: Dict[str, List[Dict[str, Any]]] = {}
@@ -322,8 +337,23 @@ def color_phase_text(phase: str) -> str:
     p = phase or "Unknown"
     return f"{phase_color(p)}{p}{C.RST}"
 
-def render_table(migs: List[Dict[str, Any]], plan_ns_map: Dict[str, str], dvas: Dict[str, Any], show_completed: bool) -> None:
-    headers = ["PLAN", "MIGRATION", "AGE", "VM", "PHASE", "STAGE", "PROGRESS", "ERROR"]
+def render_table(
+    migs: List[Dict[str, Any]],
+    plan_ns_map: Dict[str, str],
+    plan_warm_map: Dict[str, bool],
+    dvas: Dict[str, Any],
+    show_completed: bool,
+) -> None:
+    """
+    Render a compact table view:
+
+      PLAN  MIGRATION  AGE  VM  TYPE  PHASE  STAGE  PROGRESS  ERROR
+
+    TYPE   = "Warm" if either the Plan or Migration has spec.warm=true, else "Cold".
+    PHASE  = high-level MTV VM migration phase.
+    STAGE  = last reported pipeline stage name, or "-" if none.
+    """
+    headers = ["PLAN", "MIGRATION", "AGE", "VM", "TYPE", "PHASE", "STAGE", "PROGRESS", "ERROR"]
     rows: List[List[str]] = []
     dvas_items = dvas.get("items", []) or []
     for m in migs:
@@ -331,16 +361,30 @@ def render_table(migs: List[Dict[str, Any]], plan_ns_map: Dict[str, str], dvas: 
         mig_name = m.get("metadata", {}).get("name", "")
         age = age_str(m.get("metadata", {}).get("creationTimestamp", ""))
         tgt_ns = plan_ns_map.get(plan) or m.get("spec", {}).get("targetNamespace") or ""
+
+        # Determine migration type (Cold vs Warm)
+        mig_warm = m.get("spec", {}).get("warm")
+        plan_warm = plan_warm_map.get(plan)
+        if mig_warm is True or plan_warm is True:
+            mig_type = "Warm"
+        else:
+            mig_type = "Cold"
+
         for vm in (m.get("status", {}).get("vms") or []):
             vmname = vm.get("name", "")
             phase = vm.get("phase", "Unknown")
             if (phase == "Completed") and not show_completed:
                 continue
-            stage = ""
-            for s in vm.get("pipeline", []) or []:
-                if s.get("status"):
-                    stage = f"{s.get('name','stage')}:{s.get('status')}"
-                    break
+
+            # Stage: last pipeline entry name if present, "-" otherwise
+            pipeline = vm.get("pipeline") or []
+            if pipeline:
+                last_stage = pipeline[-1]
+                stage_name = last_stage.get("name") or ""
+                stage = stage_name if stage_name else "-"
+            else:
+                stage = "-"
+
             progress = ""
             mtv_prog = first_pipeline_progress(vm)
             if mtv_prog:
@@ -350,21 +394,45 @@ def render_table(migs: List[Dict[str, Any]], plan_ns_map: Dict[str, str], dvas: 
                 pct, copied_b, total_b = dv_progress_for_vm(dvas_items, tgt_ns, vmname)
                 if total_b and total_b > 0:
                     progress = f"{pct:.0f}% {human_bytes(copied_b or 0)}/{human_bytes(total_b)}"
+
             err = (vm.get("error") or {}).get("message", "")
-            rows.append([plan, mig_name, age, vmname, color_phase_text(phase), stage, progress, err])
+            rows.append([
+                plan,
+                mig_name,
+                age,
+                vmname,
+                mig_type,
+                color_phase_text(phase),
+                stage,
+                progress,
+                err,
+            ])
 
     # Print as aligned table
     cols = [len(h) for h in headers]
     for r in rows:
         for i, cell in enumerate(r):
             cols[i] = max(cols[i], visible_len(str(cell)))
+
     def fmt_row(row: List[str]) -> str:
         return "  ".join(pad_cell(str(cell), width) for cell, width in zip(row, cols))
+
     print(fmt_row(headers))
     for r in rows:
         print(fmt_row(r))
 
-def render_pretty(migs: List[Dict[str, Any]], plan_ns_map: Dict[str, str], dvas: Dict[str, Any], errors_only: bool, show_completed: bool) -> None:
+def render_pretty(
+    migs: List[Dict[str, Any]],
+    plan_ns_map: Dict[str, str],
+    plan_warm_map: Dict[str, bool],
+    dvas: Dict[str, Any],
+    errors_only: bool,
+    show_completed: bool,
+) -> None:
+    """
+    Pretty, verbose view of migrations, including TYPE (Cold/Warm),
+    pipeline stages, CDI fallback progress, and conditions.
+    """
     dvas_items = dvas.get("items", []) or []
     for m in migs:
         plan = m.get("spec", {}).get("plan", {}).get("name", "")
@@ -377,7 +445,9 @@ def render_pretty(migs: List[Dict[str, Any]], plan_ns_map: Dict[str, str], dvas:
         if conds:
             parts = []
             for c in conds:
-                t = c.get("type"); s = c.get("status"); msg = c.get("message")
+                t = c.get("type")
+                s = c.get("status")
+                msg = c.get("message")
                 if t and s:
                     parts.append(f"{t}={s}" + (f"({msg})" if msg else ""))
             if parts:
@@ -385,6 +455,14 @@ def render_pretty(migs: List[Dict[str, Any]], plan_ns_map: Dict[str, str], dvas:
         print()
 
         tgt_ns = plan_ns_map.get(plan) or m.get("spec", {}).get("targetNamespace") or ""
+
+        # Determine migration-level type (Cold vs Warm)
+        mig_warm = m.get("spec", {}).get("warm")
+        plan_warm = plan_warm_map.get(plan)
+        if mig_warm is True or plan_warm is True:
+            mig_type = "Warm"
+        else:
+            mig_type = "Cold"
 
         for vm in (m.get("status", {}).get("vms") or []):
             vmname = vm.get("name", "")
@@ -397,7 +475,7 @@ def render_pretty(migs: List[Dict[str, Any]], plan_ns_map: Dict[str, str], dvas:
 
             # Colorize phase symbol
             sym = paint_phase(phase)
-            line = f"  {sym} {vmname}  phase={color_phase_text(phase)}"
+            line = f"  {sym} {vmname}  type={mig_type}  phase={color_phase_text(phase)}"
             if err:
                 line += f"  {C.RED}error={err}{C.RST}"
             print(line)
@@ -440,7 +518,9 @@ def render_pretty(migs: List[Dict[str, Any]], plan_ns_map: Dict[str, str], dvas:
             if vconds:
                 parts = []
                 for c in vconds:
-                    t = c.get("type"); s = c.get("status"); msg = c.get("message")
+                    t = c.get("type")
+                    s = c.get("status")
+                    msg = c.get("message")
                     if t and s:
                         parts.append(f"{t}={s}" + (f"({msg})" if msg else ""))
                 if parts:
@@ -487,13 +567,21 @@ def main():
             all_obj = get_all(args.ns)
             items = all_obj.get("items", []) or []
             plan_ns_map = index_plans_target_ns(items)
+            plan_warm_map = index_plans_warm(items)
             dvas = get_all_dv()
             latest = latest_migrations_by_plan(items, args.plans)
 
             if args.style == "table":
-                render_table(latest, plan_ns_map, dvas, show_completed=args.show_completed)
+                render_table(latest, plan_ns_map, plan_warm_map, dvas, show_completed=args.show_completed)
             else:
-                render_pretty(latest, plan_ns_map, dvas, errors_only=args.errors_only, show_completed=args.show_completed)
+                render_pretty(
+                    latest,
+                    plan_ns_map,
+                    plan_warm_map,
+                    dvas,
+                    errors_only=args.errors_only,
+                    show_completed=args.show_completed,
+                )
 
             if args.show_events:
                 print()
@@ -509,3 +597,4 @@ def main():
 
 if __name__ == "__main__":
     main()
+
