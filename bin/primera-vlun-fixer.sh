@@ -11,7 +11,7 @@
 #     Primera host that corresponds to that node.
 #
 # Usage:
-#   ARRAY=primera.byu.edu USER=3paradm ./reconcile_primera_vluns_csi_aware.sh [--dry-run]
+#   ARRAY=primera.byu.edu USER=3paradm ./primera-vluns-fixer.sh [--dry-run]
 #
 set -euo pipefail
 

@@ -194,14 +194,14 @@ join -t $'\t' -j 1 "${vmi_alloc}" "${vmi_used}" \
         # filter: percent used <= threshold
         if (pct_thresh != "" && pct > pct_thresh) next
 
-        printf "%s\t%s\t%s\t%.3f\t%.3f\t%.3f\n",
+        printf "%s\t%s\t%s\t%8.2f\t%8.2f\t%8.2f\n",
                name, ns, node, allocGi, usedGi, pct
       }
     ' > "${joined}"
 
 echo
-echo "NAME                            NAMESPACE           NODE                     ALLOC_GiB  USED_GiB  PCT_USED"
-echo "---------------------------------------------------------------------------------------------------------"
+echo "NAME                   NAMESPACE         NODE                ALLOC_GiB  USED_GiB   PCT_USED"
+echo "-------------------------------------------------------------------------------------------"
 
 # Final sort
 if [[ -n "$TOP_N" ]]; then
