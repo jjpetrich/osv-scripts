@@ -10,6 +10,10 @@
 #   - For each (PV, node) pair, ensures a VLUN exists from VV=PV to the
 #     Primera host that corresponds to that node.
 #
+# Warning:
+#   - Any VLUN mappings created with this script will not be automatically removed
+#     Use with caution!
+#
 # Usage:
 #   ARRAY=primera.byu.edu USER=3paradm ./primera-vluns-fixer.sh [--dry-run]
 #
