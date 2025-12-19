@@ -2,15 +2,7 @@
 #
 # storage-health-full.sh
 #
-# Manager-side storage health runner (full, updated)
-# - Runs checks on all worker nodes via `oc debug node/... -- chroot /host ...`
-# - Writes per-node plaintext reports into ./storage_reports/
-# - Generates interactive HTML (accordion + search + sortable table) with embedded details
-# - Generates CSV summary and tarball archive for the run
-# - Copies latest.html (not a symlink) for robustness (WSL/Windows)
-# - Removes per-run plaintext files after archiving (unless --keep-plaintext)
-# - Optional --strict to escalate vendor/policy mismatches to WARN
-# - Configurable retention via --retention-days
+# Manager-side storage health runner (full, updated, with --serve option)
 #
 set -uo pipefail
 
@@ -24,6 +16,9 @@ TS="$(date +%Y%m%d-%H%M%S)"
 RETENTION_DAYS=30
 KEEP_PLAINTEXT=0
 STRICT=0
+SERVE=0
+SERVE_PORT=8000
+SERVE_BACKGROUND=0
 
 usage() {
   cat <<EOF
@@ -33,6 +28,9 @@ Options:
   --keep-plaintext         Do not remove per-run plaintext files after archiving.
   --strict                 Treat vendor/policy mismatches as real issues (escalate to WARN).
   --retention-days N       Prune run artifacts older than N days (default: ${RETENTION_DAYS}).
+  --serve                  After generating artifacts, serve storage_reports/ over HTTP.
+  --serve-port N           Port to use for the HTTP server (default: ${SERVE_PORT}).
+  --serve-background       Run the HTTP server in the background (nohup); log in storage_reports/http_server_<TS>.log.
   --help                   Show this help.
 EOF
   exit 1
@@ -48,6 +46,13 @@ while [[ $# -gt 0 ]]; do
       if [[ $# -eq 0 ]]; then echo "Missing arg for --retention-days"; usage; fi
       RETENTION_DAYS="$1"; shift
       ;;
+    --serve) SERVE=1; shift ;;
+    --serve-port)
+      shift
+      if [[ $# -eq 0 ]]; then echo "Missing arg for --serve-port"; usage; fi
+      SERVE_PORT="$1"; shift
+      ;;
+    --serve-background) SERVE_BACKGROUND=1; shift ;;
     --help) usage ;;
     *) echo "Unknown arg: $1"; usage ;;
   esac
@@ -63,13 +68,9 @@ CSV_PATH="${OUT_DIR}/storage_health_${TS}.csv"
 run_on_node() {
   local node="$1"; shift
   local cmd="$*"
-  # run a compact command on the host via oc debug
   oc debug "node/${node}" -- chroot /host /bin/bash -c "${cmd}"
 }
 
-# analyze multipath - ll (local)
-# Writes a plaintext report to $report, a small HTML block to $html_block,
-# and echoes a CSV line: node,total_luns,total_ok,total_issues,total_bad_paths,status
 analyze_multipath() {
   local node="$1"
   local mpfile="$2"
@@ -90,17 +91,14 @@ analyze_multipath() {
       echo "OVERALL STATUS : UNKNOWN (no multipath output)"
       echo
     else
-      # split into LUN blocks
       awk -v RS= -v ORS="\n---\n" 'NF' "${mpfile}" > "${mpfile}.blocks"
 
       while IFS= read -r block; do
         [[ -z "${block}" ]] && continue
-        # identify LUN header lines by WWID+dm-x presence
         if ! grep -qE '^[0-9a-f]{32,} dm-[0-9]+' <<< "${block}"; then
           continue
         fi
 
-        # count LUN once per block
         ((total_luns++))
 
         header="$(printf '%s\n' "${block}" | head -n1)"
@@ -125,19 +123,15 @@ analyze_multipath() {
         local lun_bad_paths=0
         local lun_has_issue=0
 
-        # capture path-group header lines (may not always exist in a consistent format)
         pg_lines="$(printf '%s\n' "${block}" | grep -E "policy=" || true)"
 
         if [[ -z "${pg_lines}" ]]; then
-          # Parser couldn't find explicit groups — but we should still search for path lines
           echo "  NOTE: parser could not find path-group headers for this LUN."
-          # We'll still scan the entire block for path lines and determine bad paths
           following_lines="$(printf '%s\n' "${block}")"
         else
           following_lines="$(printf '%s\n' "${block}")"
         fi
 
-        # scan for path lines in the block and count bad paths
         while IFS= read -r pline; do
           [[ -z "${pline}" ]] && continue
           if ! grep -qE '[0-9]+:[0-9]+:[0-9]+:[0-9]+' <<< "${pline}"; then
@@ -156,7 +150,6 @@ analyze_multipath() {
           fi
         done <<< "${following_lines}"
 
-        # Check vendor/policy heuristics *only* as notes by default; in strict mode they escalate
         if [[ -n "${pg_lines}" ]]; then
           while IFS= read -r pg; do
             [[ -z "${pg}" ]] && continue
@@ -164,7 +157,6 @@ analyze_multipath() {
             prio="$(awk '{for(i=1;i<=NF;i++) if($i ~ /^prio=/) {sub("prio=","",$i); print $i}}' <<< "${pg}" || true)"
             echo "  Path group note: policy=${policy} prio=${prio}"
             if [[ "${STRICT}" -eq 1 ]]; then
-              # Escalate vendor/policy mismatches to an "issue"
               if [[ "${array_type}" == "PowerStore" ]]; then
                 if [[ "${policy}" != "queue-length 0" || ( "${prio}" != "50" && "${prio}" != "10" ) ]]; then
                   lun_has_issue=1
@@ -176,7 +168,6 @@ analyze_multipath() {
           done <<< "${pg_lines}"
         fi
 
-        # final LUN classification
         if [[ "${lun_bad_paths}" -gt 0 ]] || [[ "${lun_has_issue}" -eq 1 && "${STRICT}" -eq 1 ]]; then
           echo "  LUN SUMMARY: *** ISSUES DETECTED (bad_paths=${lun_bad_paths}) ***"
           ((total_issues++))
@@ -205,7 +196,6 @@ analyze_multipath() {
 
   } > "${report}"
 
-  # Build HTML block (accordion) for embedding
   {
     echo "<div class=\"node-block node-${status_out,,}\">"
     if [[ "${status_out}" == "WARN" ]]; then
@@ -222,7 +212,6 @@ analyze_multipath() {
     echo "</div>"
   } > "${html_block}"
 
-  # emit CSV line
   echo "${node},${total_luns},${total_ok},${total_issues},${total_bad_paths},${status_out}"
 }
 
@@ -235,10 +224,8 @@ echo "Running storage health checks on worker nodes:"
 echo "${NODES}"
 echo
 
-# CSV header
 echo "node,total_luns,total_ok,total_issues,total_bad_paths,status" > "${CSV_PATH}"
 
-# tmp accumulator for HTML blocks
 HTML_BLOCKS_TMP="$(mktemp)"
 > "${HTML_BLOCKS_TMP}"
 declare -a SUMMARY_LINES=()
@@ -271,15 +258,12 @@ for node in ${NODES}; do
 
   csv_line="$(analyze_multipath "${node}" "${MPFILE}" "${REPORT_FINAL}.mp" "${HTML_BLOCK}")" || csv_line="${node},0,0,0,0,UNKNOWN"
 
-  # combine plaintext report
   cat "${REPORT_FINAL}.tmp" "${REPORT_FINAL}.mp" > "${REPORT_FINAL}" || true
   rm -f "${REPORT_FINAL}.tmp" "${REPORT_FINAL}.mp" "${MPFILE}.blocks" 2>/dev/null || true
 
-  # append HTML block
   cat "${HTML_BLOCK}" >> "${HTML_BLOCKS_TMP}" || true
   rm -f "${HTML_BLOCK}" 2>/dev/null || true
 
-  # append CSV
   echo "${csv_line}" >> "${CSV_PATH}"
 
   SUMMARY_LINES+=("${csv_line}")
@@ -361,7 +345,6 @@ tr.unknown { background: #f3f3f3; }
 HTML_HEAD
 } > "${HTML_TMP}"
 
-# append table rows
 for s in "${SUMMARY_LINES[@]}"; do
   node="$(awk -F, '{print $1}' <<< "${s}")"
   total_luns="$(awk -F, '{print $2}' <<< "${s}")"
@@ -376,7 +359,6 @@ for s in "${SUMMARY_LINES[@]}"; do
     "${rowclass}" "${node}" "${total_luns}" "${total_ok}" "${total_issues}" "${total_bad_paths}" "${status}" >> "${HTML_TMP}"
 done
 
-# finish header and insert node blocks
 cat >> "${HTML_TMP}" <<'HTML_MID'
 </tbody>
 </table>
@@ -384,13 +366,10 @@ cat >> "${HTML_TMP}" <<'HTML_MID'
 <h2>Per-node details (click header to expand)</h2>
 HTML_MID
 
-# append the built node blocks
 cat "${HTML_BLOCKS_TMP}" >> "${HTML_TMP}"
 
-# append JS (sorting/filter/accordion)
 cat >> "${HTML_TMP}" <<'HTML_TAIL'
 <script>
-// Simple client-side sort, filter, and accordion behavior
 document.addEventListener('DOMContentLoaded', function () {
   const table = document.getElementById('summaryTable');
   const headers = table.querySelectorAll('th[data-col]');
@@ -411,7 +390,6 @@ document.addEventListener('DOMContentLoaded', function () {
     });
   });
 
-  // filter input
   const filterInput = document.getElementById('nodeFilter');
   filterInput.addEventListener('input', function () {
     const q = filterInput.value.trim().toLowerCase();
@@ -429,7 +407,6 @@ document.addEventListener('DOMContentLoaded', function () {
     });
   });
 
-  // accordion wiring
   const accs = document.querySelectorAll('.accordion');
   accs.forEach(function (acc) {
     acc.addEventListener('click', function () {
@@ -447,7 +424,6 @@ document.addEventListener('DOMContentLoaded', function () {
     });
   });
 
-  // expand/collapse all
   document.getElementById('expandAll').addEventListener('click', function () {
     document.querySelectorAll('.accordion').forEach(function (acc) {
       acc.setAttribute('aria-expanded','true');
@@ -469,12 +445,10 @@ document.addEventListener('DOMContentLoaded', function () {
 </html>
 HTML_TAIL
 
-# Replace placeholders and write final HTML
 GEN_DATE="$(date)"
 sed "s|__GEN_DATE__|${GEN_DATE}|g; s|__OUTDIR__|${OUT_DIR}|g; s|__TARPATH__|${TAR_PATH}|g" "${HTML_TMP}" > "${HTML_PATH}"
 rm -f "${HTML_TMP}"
 
-# Create tarball with this run's artifacts
 echo "Creating tarball ${TAR_PATH} ..."
 tar -C "${OUT_DIR}" -czf "${TAR_PATH}" \
   "$(basename "${HTML_PATH}")" \
@@ -482,10 +456,9 @@ tar -C "${OUT_DIR}" -czf "${TAR_PATH}" \
   storage_health_*_"${TS}".txt \
   multipath_ll_*_"${TS}".txt 2>/dev/null || echo "tar: some files may be missing; archive incomplete"
 
-# Copy latest.html (not symlink) for robustness (WSL/Windows)
+# Copy latest.html (not symlink) for robustness
 cp -f "${HTML_PATH}" "${OUT_DIR}/latest.html"
 
-# Optionally remove per-run plaintext files (keep only HTML, CSV, tar)
 if [[ "${KEEP_PLAINTEXT}" -eq 0 ]]; then
   echo "Removing per-run plaintext files for this run..."
   shopt -s nullglob
@@ -495,13 +468,11 @@ else
   echo "Keeping per-run plaintext files (per --keep-plaintext)."
 fi
 
-# Prune old artifacts older than RETENTION_DAYS
 if [[ "${RETENTION_DAYS}" -gt 0 ]]; then
   echo "Pruning files older than ${RETENTION_DAYS} days in ${OUT_DIR} ..."
   find "${OUT_DIR}" -maxdepth 1 -type f -mtime +"${RETENTION_DAYS}" -name 'storage_health_*' -print -delete 2>/dev/null || true
 fi
 
-# Cleanup temp
 rm -f "${HTML_BLOCKS_TMP}"
 
 echo
@@ -510,9 +481,33 @@ echo "HTML summary: ${HTML_PATH}"
 echo "CSV summary : ${CSV_PATH}"
 echo "Archive     : ${TAR_PATH}"
 echo "Latest HTML : ${OUT_DIR}/latest.html"
-if [[ "${KEEP_PLAINTEXT}" -eq 1 ]]; then
-  echo "Note: per-run plaintext files were preserved (--keep-plaintext)."
+if [[ "${KEEP_PLAINTEXT}" -eq 1 ]]; then echo "Note: per-run plaintext files were preserved (--keep-plaintext)."; fi
+if [[ "${STRICT}" -eq 1 ]]; then echo "Note: running in STRICT mode (vendor/policy mismatches escalate to WARN)."; fi
+
+# --------------------
+# Serve option
+# --------------------
+if [[ "${SERVE}" -eq 1 ]]; then
+  if ! command -v python3 >/dev/null 2>&1; then
+    echo "ERROR: python3 not found; cannot start HTTP server. Install python3 or omit --serve." >&2
+    exit 1
+  fi
+
+  SERVE_CMD=(python3 -m http.server "${SERVE_PORT}" --directory "${OUT_DIR}")
+  if [[ "${SERVE_BACKGROUND}" -eq 1 ]]; then
+    LOG="${OUT_DIR}/http_server_${TS}.log"
+    echo "Starting HTTP server in background on port ${SERVE_PORT}; logging to ${LOG}"
+    nohup "${SERVE_CMD[@]}" > "${LOG}" 2>&1 &
+    PID=$!
+    echo "Server started (PID ${PID}). To stop: kill ${PID}"
+    echo "Open: http://localhost:${SERVE_PORT}/latest.html"
+  else
+    echo "Starting HTTP server (foreground) on port ${SERVE_PORT} -- press Ctrl-C to stop"
+    echo "Open: http://localhost:${SERVE_PORT}/latest.html"
+    # run in foreground (this blocks until interrupted)
+    "${SERVE_CMD[@]}"
+    # when server stops, continue/exit
+  fi
 fi
-if [[ "${STRICT}" -eq 1 ]]; then
-  echo "Note: running in STRICT mode (vendor/policy mismatches escalate to WARN)."
-fi
+
+exit 0
