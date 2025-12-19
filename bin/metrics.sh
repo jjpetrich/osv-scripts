@@ -1,0 +1,1080 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+SCRIPT_NAME="$(basename "$0")"
+VERSION="v4.2.0"
+
+print_help() {
+  cat <<'HELP'
+showclusterinfo
+Report requested (BOOKED) vs allocatable vs live usage per node, with optional
+debug listing of per-pod Requests / Limits / Usage. Includes node STATUS
+next to node name and supports node-scoped views.
+
+SUMMARY
+  BOOKED (node)    = Sum of pod memory *requests* scheduled on that node.
+  ALLOC(mem)       = Node .status.allocatable.memory.
+  BOOKED%          = floor(BOOKED / ALLOC * 100).
+  USAGE            = Live memory usage from metrics API (oc/kubectl top).
+  USED%            = floor(USAGE / ALLOC * 100).
+  CPU_BOOKED       = Sum of pod CPU *requests* scheduled on that node (cores).
+  CPU_ALLOC        = Node .status.allocatable.cpu (cores).
+  CPU_USAGE        = Live CPU usage (cores) from metrics (top pods).
+  CPU_USED%        = floor(CPU_USAGE / CPU_ALLOC * 100).
+  CPU_CORES        = Node .status.capacity.cpu (cores).
+  CAPACITY_Gi      = Node .status.capacity.memory (GiB).
+
+REQUIREMENTS
+  - oc (logged in), jq
+  - For --show-usage: working metrics API (e.g., 'oc adm top pods -A').
+
+USAGE
+  showclusterinfo [OPTIONS]
+
+OPTIONS
+  --vm-only                Only KubeVirt VM pods (label kubevirt.io=virt-launcher)
+  --namespace, -n NS       Restrict to a single namespace
+  --debug                  Print diagnostics & per-pod list (Requests [+Limits/Usage])
+  --debug-all-pods         With --debug, print all per-pod lines (instead of first 200)
+  --node NAME              (debug) Show only pods scheduled on the given node; implies
+                           untruncated per-pod list
+  --node-scope-main        Also scope the main tables to the single node given
+  --show-limits            Include memory limits in per-pod debug listing
+  --show-usage             Include live usage; combines into main table if metrics available
+                           (default: on)
+  --no-usage               Skip metrics; show booked vs alloc only
+  --show-node-capacity     Add CPU_CORES and CAPACITY_Gi columns to the main table
+                           (default: off)
+  --show-cpu               Add CPU columns (booked/alloc/usage/%s) to the main table
+                           (default: on)
+  --include-controllers    Include control-plane/master nodes in the main tables
+                           (default: only workers)
+  --sort-col COL        Sort main table by COL: NODE, BOOKED%, USED%, CPU_BOOKED%, CPU_USED%
+                           (default: NODE)
+  --version                Print version and cluster info
+  -h, --help, help         Show this help
+
+NOTES
+  * Usage columns appear only if metrics collection succeeds.
+  * Colors are only applied when live usage is present (has metrics).
+
+EXAMPLES
+  showclusterinfo
+  showclusterinfo --vm-only -n byu-chemistry
+  showclusterinfo --vm-only --debug --show-limits --show-usage --show-cpu
+  showclusterinfo --show-node-capacity --show-usage --show-cpu
+  showclusterinfo --debug --node radium04.byu.edu --node-scope-main
+HELP
+}
+
+print_version() {
+  local user server ctx cluster ocv
+  user="$(oc whoami 2>/dev/null || echo 'unknown')"
+  server="$(oc whoami --show-server 2>/dev/null || echo 'unknown')"
+  ctx="$(oc whoami --show-context 2>/dev/null || echo 'unknown')"
+  cluster="$(oc config current-context 2>/dev/null || echo 'unknown')"
+  ocv="$(
+    { oc version --client --short 2>/dev/null || true; } | sed -n '1p'
+  )"
+  if [[ -z "$ocv" ]]; then
+    ocv="$(
+      { oc version --client 2>/dev/null || true; } \
+      | sed -n '1,2p' | tr '\n' ' ' | sed 's/[[:space:]]\+/ /g'
+    )"
+  fi
+  [[ -z "$ocv" ]] && ocv="oc (unknown)"
+
+  cat <<EOF
+$SCRIPT_NAME $VERSION
+User:     $user
+Server:   $server
+Context:  $ctx
+Cluster:  $cluster
+$ocv
+EOF
+}
+
+# ------------------------ FLAGS ------------------------
+VM_ONLY=0
+NODE_FILTER=""
+NODE_SCOPE_MAIN=0
+NAMESPACE=""
+DEBUG=0
+DEBUG_ALL_PODS=0
+SHOW_LIMITS=0
+SHOW_USAGE=1
+SHOW_NODE_CAPACITY=0
+SHOW_CPU=1
+INCLUDE_CONTROLLERS=0
+INCLUDE_CONTROLLERS=0
+#SORT_COLUMN="USED"
+#SORT_COLUMN="BOOKED"
+SORT_COLUMN="NODE"
+
+# ---------------- Color Thresholds ----------------
+MAX_GREEN=79      # Percent value at or below this is GREEN
+MAX_YELLOW=89     # Percent up to here (and above MAX_GREEN) is YELLOW
+# Anything > MAX_YELLOW becomes RED
+
+# ------------------------ ARG PARSE ------------------------
+HELP_TEXT="$(print_help)"
+
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    --vm-only) VM_ONLY=1; shift ;;
+    --namespace|-n) NAMESPACE="${2:-}"; shift 2 ;;
+    --debug) DEBUG=1; shift ;;
+    --debug-all-pods) DEBUG=1; DEBUG_ALL_PODS=1; shift ;;
+    --node) NODE_FILTER="${2:-}"; shift 2 ;;
+    --node-scope-main) NODE_SCOPE_MAIN=1; shift ;;
+    --show-limits) SHOW_LIMITS=1; shift ;;
+    --show-usage) SHOW_USAGE=1; shift ;;
+    --no-usage) SHOW_USAGE=0; shift ;;
+    --show-node-capacity) SHOW_NODE_CAPACITY=1; shift ;;
+    --show-cpu) SHOW_CPU=1; shift ;;
+    --include-controllers) INCLUDE_CONTROLLERS=1; shift ;;
+    --include-controllers) INCLUDE_CONTROLLERS=1; shift ;;
+    --sort-col)
+      val="${2:-}"
+      case "$val" in
+        NODE|node|Node)
+          SORT_COLUMN="NODE"
+          ;;
+        B|b|BOOKED|booked|Booked|BOOKED%|booked%|Booked%)
+          SORT_COLUMN="BOOKED%"
+          ;;
+        U|u|USED|used|Used|USED%|used%|Used%)
+          SORT_COLUMN="USED%"
+          ;;
+        CPU_BOOKED|cpu_booked|Cpu_booked|CPU_BOOKED%|cpu_booked%|Cpu_booked%)
+          SORT_COLUMN="CPU_BOOKED%"
+          ;;
+        CPU_USED|cpu_used|Cpu_used|CPU_USED%|cpu_used%|Cpu_used%)
+          SORT_COLUMN="CPU_USED%"
+          ;;
+        *)
+          echo "ERROR: --sort-column must be one of NODE, BOOKED%, USED%, CPU_BOOKED%, CPU_USED% (got '$val')" >&2
+          exit 1
+          ;;
+      esac
+      shift 2 ;;
+    --version) print_version; exit 0 ;;
+    -h|--help|help) echo "$HELP_TEXT"; exit 0 ;;
+    *)
+      echo "Unknown option: $1" >&2
+      echo "$HELP_TEXT" >&2
+      exit 1
+      ;;
+  esac
+done
+
+# If a node filter is requested, force debug + untruncated per-pod list
+if [[ -n "$NODE_FILTER" ]]; then
+  DEBUG=1
+  DEBUG_ALL_PODS=1
+fi
+
+# ------------------------ SANITY CHECKS ------------------------
+command -v oc >/dev/null 2>&1 || { echo "oc not found in PATH"; exit 1; }
+command -v jq >/dev/null 2>&1 || { echo "jq not found in PATH"; exit 1; }
+
+if ! oc whoami >/dev/null 2>&1; then
+  echo "You're not logged in to a cluster (oc whoami failed). Run: oc login ..." >&2
+  exit 1
+fi
+
+# ------------------------ TEMP FILES ------------------------
+TMPDIR="$(mktemp -d)"
+trap 'rm -rf "$TMPDIR"' EXIT
+
+NODES_JSON="$TMPDIR/nodes.json"
+PODS_JSON="$TMPDIR/pods.json"
+TOP_PODS="$TMPDIR/top_pods.txt"
+USAGE_MEM_TSV="$TMPDIR/usage_mem.tsv"
+USAGE_CPU_TSV="$TMPDIR/usage_cpu.tsv"
+PER_POD_TSV_FILE="$TMPDIR/per_pod.tsv"
+NODES_METRICS_TSV_FILE="$TMPDIR/nodes_metrics.tsv"
+POD_NODE_JOIN="$TMPDIR/pod_node.tsv"
+USAGE_MEM_NODE_TSV_FILE="$TMPDIR/usage_mem_node.tsv"
+USAGE_CPU_NODE_TSV_FILE="$TMPDIR/usage_cpu_node.tsv"
+
+# ------------------------ DATA GATHER ------------------------
+oc get nodes -o json >"$NODES_JSON"
+
+if [[ -n "$NAMESPACE" ]]; then
+  oc get pods -n "$NAMESPACE" -o json >"$PODS_JSON"
+else
+  oc get pods -A -o json >"$PODS_JSON"
+fi
+
+# ------------------------ COLLECT USAGE (optional) ------------------------
+collect_usage() {
+  local cmds=(
+    "oc top pods -A"
+    "oc adm top pods -A"
+    "kubectl top pods -A"
+  )
+  local c OUT
+  for c in "${cmds[@]}"; do
+    if OUT="$($c 2>/dev/null)"; then
+      if [[ -n "$OUT" ]]; then
+        # Strip header if present
+        echo "$OUT" | awk 'NR==1 && $1=="NAMESPACE"{next} {print}' >"$TOP_PODS"
+        if [[ -s "$TOP_PODS" ]]; then
+          [[ $DEBUG -eq 1 ]] && echo "DEBUG: using usage command: $c"
+          return 0
+        fi
+      fi
+    fi
+  done
+  return 1
+}
+
+HAS_USAGE=0
+
+if [[ $SHOW_USAGE -eq 1 ]]; then
+  if collect_usage; then
+    : >"$USAGE_MEM_TSV"
+    : >"$USAGE_CPU_TSV"
+    awk -v memFile="$USAGE_MEM_TSV" -v cpuFile="$USAGE_CPU_TSV" '
+      function toGi(val){
+        if (val ~ /Gi$/){ sub(/Gi$/,"",val); return val+0 }
+        if (val ~ /Mi$/){ sub(/Mi$/,"",val); return (val+0)/1024 }
+        if (val ~ /Ki$/){ sub(/Ki$/,"",val); return (val+0)/1048576 }
+        if (val ~ /^[0-9]+$/){ return (val+0)/1073741824 }
+        return 0
+      }
+      function toCores(v){
+        if (v ~ /m$/){ sub(/m$/,"",v); return (v+0)/1000.0 }
+        return v+0
+      }
+      NF>=4 {
+        ns=$1; pod=$2; cpu=$3; mem=$4;
+        printf "%s\t%s\t%.2f\n", ns, pod, toGi(mem)  >> memFile
+        printf "%s\t%s\t%.3f\n", ns, pod, toCores(cpu) >> cpuFile
+      }
+    ' "$TOP_PODS"
+    if [[ -n "$NAMESPACE" ]]; then
+      awk -v ns="$NAMESPACE" -F'\t' '$1==ns' "$USAGE_MEM_TSV" >"$USAGE_MEM_TSV.tmp" && mv "$USAGE_MEM_TSV.tmp" "$USAGE_MEM_TSV"
+      awk -v ns="$NAMESPACE" -F'\t' '$1==ns' "$USAGE_CPU_TSV" >"$USAGE_CPU_TSV.tmp" && mv "$USAGE_CPU_TSV.tmp" "$USAGE_CPU_TSV"
+    fi
+    if [[ -s "$USAGE_MEM_TSV" ]]; then
+      HAS_USAGE=1
+    else
+      echo "WARN: metrics command returned no usable memory rows; omitting usage." >&2
+      SHOW_USAGE=0
+    fi
+  else
+    echo "WARN: could not collect pod usage (oc top/oc adm top/kubectl top); omitting usage." >&2
+    SHOW_USAGE=0
+  fi
+fi
+
+# ------------------------ JQ SCRIPTS (on disk for simpler quoting) --------
+JQ_PERPOD="$TMPDIR/per_pod.jq"
+cat >"$JQ_PERPOD" <<'EOF'
+def q_to_bytes:
+  if . == null then 0
+  elif type == "number" then .
+  elif type == "string" then
+    ( . as $s
+    | if ($s|test("^[0-9.]+(Ki|Mi|Gi|Ti|Pi)?$")) then
+        capture("^(?<num>[0-9.]+)(?<unit>Ki|Mi|Gi|Ti|Pi)?$") as $m
+        | ($m.num|tonumber) * (
+            if   ($m.unit//"") == "Ki" then 1024
+            elif ($m.unit//"") == "Mi" then 1024*1024
+            elif ($m.unit//"") == "Gi" then 1024*1024*1024
+            elif ($m.unit//"") == "Ti" then 1024*1024*1024*1024
+            elif ($m.unit//"") == "Pi" then 1024*1024*1024*1024*1024
+            else 1 end)
+      else (try (.|tonumber) catch 0) end )
+  else 0 end;
+
+def cpu_to_cores:
+  if . == null then 0
+  elif type == "number" then .
+  elif (type=="string" and test("m$")) then (sub("m$";"") | tonumber) / 1000
+  elif (type=="string") then (try (.|tonumber) catch 0)
+  else 0 end;
+
+def sum_or_zero: if (type=="array" and length>0) then add else 0 end;
+def max_or_zero: if (type=="array" and length>0) then max else 0 end;
+
+def pod_request_bytes:
+  ( [ .spec.containers[]?.resources.requests.memory | q_to_bytes ] | sum_or_zero ) as $sum_cont
+  | ( [ .spec.initContainers[]?.resources.requests.memory | q_to_bytes ] | max_or_zero ) as $max_init
+  | (if $max_init > $sum_cont then $max_init else $sum_cont end);
+
+def pod_limit_bytes:
+  ( [ .spec.containers[]?.resources.limits.memory | q_to_bytes ] | sum_or_zero ) as $sum_cont
+  | ( [ .spec.initContainers[]?.resources.limits.memory | q_to_bytes ] | max_or_zero ) as $max_init
+  | (if $max_init > $sum_cont then $max_init else $sum_cont end);
+
+def pod_request_cpu:
+  ( [ .spec.containers[]?.resources.requests.cpu | cpu_to_cores ] | sum_or_zero ) as $sum_cont
+  | ( [ .spec.initContainers[]?.resources.requests.cpu | cpu_to_cores ] | max_or_zero ) as $max_init
+  | (if $max_init > $sum_cont then $max_init else $sum_cont end);
+
+def pod_limit_cpu:
+  ( [ .spec.containers[]?.resources.limits.cpu | cpu_to_cores ] | sum_or_zero ) as $sum_cont
+  | ( [ .spec.initContainers[]?.resources.limits.cpu | cpu_to_cores ] | max_or_zero ) as $max_init
+  | (if $max_init > $sum_cont then $max_init else $sum_cont end);
+
+($pods[0].items // [])
+| map(select(.spec.nodeName != null))
+| map(select(.status.phase != "Succeeded" and .status.phase != "Failed"))
+| (if $vm_only == 1
+     then map(select(.metadata.labels."kubevirt.io" == "virt-launcher"))
+     else .
+   end)
+| .[]
+| ( .metadata.namespace // "" ) as $ns
+| ( .metadata.name // "" ) as $name
+| ( .spec.nodeName // "" ) as $node
+| pod_request_bytes as $reqB
+| pod_limit_bytes   as $limB
+| pod_request_cpu   as $reqC
+| pod_limit_cpu     as $limC
+| [ $ns, $name, $node,
+    ($reqB / (1024*1024*1024)),
+    ($limB / (1024*1024*1024)),
+    $reqC,
+    $limC
+  ]
+| @tsv
+EOF
+
+JQ_NODES="$TMPDIR/nodes_metrics.jq"
+cat >"$JQ_NODES" <<'EOF'
+def q_to_bytes:
+  if . == null then 0
+  elif type == "number" then .
+  elif type == "string" then
+    ( . as $s
+    | if ($s|test("^[0-9.]+(Ki|Mi|Gi|Ti|Pi)?$")) then
+        capture("^(?<num>[0-9.]+)(?<unit>Ki|Mi|Gi|Ti|Pi)?$") as $m
+        | ($m.num|tonumber) * (
+            if   ($m.unit//"") == "Ki" then 1024
+            elif ($m.unit//"") == "Mi" then 1024*1024
+            elif ($m.unit//"") == "Gi" then 1024*1024*1024
+            elif ($m.unit//"") == "Ti" then 1024*1024*1024*1024
+            elif ($m.unit//"") == "Pi" then 1024*1024*1024*1024*1024
+            else 1 end)
+      else (try (.|tonumber) catch 0) end )
+  else 0 end;
+
+def cpu_to_cores:
+  if . == null then 0
+  elif type=="number" then .
+  elif (type=="string" and test("m$")) then (sub("m$";"") | tonumber) / 1000
+  elif (type=="string") then (try (.|tonumber) catch 0)
+  else 0 end;
+
+def sum_or_zero: if (type=="array" and length>0) then add else 0 end;
+def max_or_zero: if (type=="array" and length>0) then max else 0 end;
+
+def pod_request_bytes:
+  ( [ .spec.containers[]?.resources.requests.memory | q_to_bytes ] | sum_or_zero ) as $sum_cont
+  | ( [ .spec.initContainers[]?.resources.requests.memory | q_to_bytes ] | max_or_zero ) as $max_init
+  | (if $max_init > $sum_cont then $max_init else $sum_cont end);
+
+def pod_request_cpu:
+  ( [ .spec.containers[]?.resources.requests.cpu | cpu_to_cores ] | sum_or_zero ) as $sum_cont
+  | ( [ .spec.initContainers[]?.resources.requests.cpu | cpu_to_cores ] | max_or_zero ) as $max_init
+  | (if $max_init > $sum_cont then $max_init else $sum_cont end);
+
+($pods[0].items // []) as $all_pods
+| ($nodes[0].items // []) as $all_nodes
+|
+( $all_pods
+  | map(select(.spec.nodeName != null))
+  | map(select(.status.phase != "Succeeded" and .status.phase != "Failed"))
+  | (if $vm_only == 1
+       then map(select(.metadata.labels."kubevirt.io" == "virt-launcher"))
+       else .
+     end)
+) as $pods_list
+|
+( if $include_ctl == 1
+    then $all_nodes
+    else ( $all_nodes
+           | map(select(
+               (.metadata.labels["node-role.kubernetes.io/master"] | not)
+               and (.metadata.labels["node-role.kubernetes.io/control-plane"] | not)
+             ))
+      )
+  end
+) as $nodes_list
+|
+$nodes_list[]
+| .metadata.name as $node
+| (if (.metadata.labels["node-role.kubernetes.io/master"] or .metadata.labels["node-role.kubernetes.io/control-plane"])
+     then "controller" else "worker" end) as $role
+| ( .status.conditions // [] | map(select(.type=="Ready"))[0].status == "True" ) as $ready
+| ( .spec.unschedulable // false ) as $unsched
+| ( (if $ready then "Ready" else "NotReady" end)
+    + (if $unsched then ",SchedulingDisabled" else "" end)
+  ) as $status
+| (.status.allocatable.memory | q_to_bytes) as $alloc_bytes
+| (.status.capacity.memory    | q_to_bytes) as $cap_bytes
+| (.status.allocatable.cpu    | cpu_to_cores) as $alloc_cpu
+| (.status.capacity.cpu       | cpu_to_cores) as $cap_cpu
+| ( [ $pods_list[]
+      | select(.spec.nodeName == $node)
+      | pod_request_bytes
+    ] | sum_or_zero ) as $booked_bytes
+| ( [ $pods_list[]
+      | select(.spec.nodeName == $node)
+      | pod_request_cpu
+    ] | sum_or_zero ) as $booked_cpu
+| ( $alloc_bytes / (1024*1024*1024) ) as $allocGi_raw
+| ( $booked_bytes / (1024*1024*1024) ) as $bookedGi_raw
+| ( ($allocGi_raw*100|floor)/100 ) as $allocGi
+| ( ($bookedGi_raw*100|floor)/100 ) as $bookedGi
+| ( if $alloc_bytes == 0 then 0 else (($booked_bytes*100.0)/$alloc_bytes)|floor end ) as $bookedPct
+| ( if $alloc_cpu == 0 then 0 else (($booked_cpu*100.0)/$alloc_cpu)|floor end ) as $cpuBookedPct
+| [ $node,
+    $role,
+    $status,
+    $allocGi,
+    $bookedGi,
+    $bookedPct,
+    $alloc_cpu,
+    $booked_cpu,
+    $cpuBookedPct,
+    $cap_cpu,
+    ($cap_bytes/(1024*1024*1024))
+  ]
+| @tsv
+EOF
+
+# ------------------------ PER-POD TSV (for debug & usage aggregation) -----
+NEED_PODS_LIST=0
+if [[ $DEBUG -eq 1 ]]; then NEED_PODS_LIST=1; fi
+if [[ $SHOW_USAGE -eq 1 ]]; then NEED_PODS_LIST=1; fi
+
+PER_POD_TSV=""
+if [[ $NEED_PODS_LIST -eq 1 ]]; then
+  PER_POD_TSV="$(
+    jq -r -n \
+      --argjson vm_only "$VM_ONLY" \
+      --slurpfile pods "$PODS_JSON" \
+      -f "$JQ_PERPOD"
+  )"
+  printf "%s\n" "$PER_POD_TSV" >"$PER_POD_TSV_FILE"
+fi
+
+# ------------------------ PER-NODE BOOKED/ALLOC (MEM & CPU) --------------
+NODES_METRICS_TSV="$(
+  jq -r -n \
+    --argjson vm_only "$VM_ONLY" \
+    --argjson include_ctl "$INCLUDE_CONTROLLERS" \
+    --slurpfile nodes "$NODES_JSON" \
+    --slurpfile pods "$PODS_JSON" \
+    -f "$JQ_NODES"
+)"
+printf "%s\n" "$NODES_METRICS_TSV" >"$NODES_METRICS_TSV_FILE"
+
+# Debug: node counts
+if [[ $DEBUG -eq 1 ]]; then
+  total_nodes=$(printf "%s\n" "$NODES_METRICS_TSV" | awk 'NF{c++}END{print c+0}')
+  worker_nodes=$(printf "%s\n" "$NODES_METRICS_TSV" | awk -F'\t' '$2=="worker"{c++}END{print c+0}')
+  controller_nodes=$(printf "%s\n" "$NODES_METRICS_TSV" | awk -F'\t' '$2=="controller"{c++}END{print c+0}')
+  echo "DEBUG: Nodes: $total_nodes"
+  echo "DEBUG: Worker Nodes: $worker_nodes"
+  echo "DEBUG: Controller Nodes: $controller_nodes"
+fi
+
+# ------------------------ Aggregate usage per node (if we have usage) -----
+USAGE_MEM_NODE_TSV=""
+USAGE_CPU_NODE_TSV=""
+
+if [[ $HAS_USAGE -eq 1 && -s "$USAGE_MEM_TSV" && -s "$PER_POD_TSV_FILE" ]]; then
+  # Build ns/pod -> node map
+  awk -F'\t' 'NF{ printf "%s/%s\t%s\n",$1,$2,$3 }' "$PER_POD_TSV_FILE" >"$POD_NODE_JOIN"
+
+  USAGE_MEM_NODE_TSV="$(
+    awk -F'\t' '
+      NR==FNR { node[$1]=$2; next }
+      { key=$1"/"$2; n=node[key]; if(n!=""){ sum[n]+=$3 } }
+      END{ for (n in sum) printf "%s\t%.2f\n", n, sum[n] }
+    ' "$POD_NODE_JOIN" "$USAGE_MEM_TSV"
+  )"
+  printf "%s\n" "$USAGE_MEM_NODE_TSV" >"$USAGE_MEM_NODE_TSV_FILE"
+
+  if [[ $SHOW_CPU -eq 1 && -s "$USAGE_CPU_TSV" ]]; then
+    USAGE_CPU_NODE_TSV="$(
+      awk -F'\t' '
+        NR==FNR { node[$1]=$2; next }
+        { key=$1"/"$2; n=node[key]; if(n!=""){ sum[n]+=$3 } }
+        END{ for (n in sum) printf "%s\t%.3f\n", n, sum[n] }
+      ' "$POD_NODE_JOIN" "$USAGE_CPU_TSV"
+    )"
+    printf "%s\n" "$USAGE_CPU_NODE_TSV" >"$USAGE_CPU_NODE_TSV_FILE"
+  fi
+fi
+
+# ------------------------ Node-scope main tables (optional) --------------
+if [[ $NODE_SCOPE_MAIN -eq 1 && -n "$NODE_FILTER" ]]; then
+  norm_node="$(printf "%s" "$NODE_FILTER" \
+               | awk '{print tolower($0)}' \
+               | sed -E 's/^[[:space:]]+|[[:space:]]+$//g')"
+
+  filter_tsv_to_node() {
+    awk -v n="$norm_node" -F'\t' '
+      BEGIN{ n=tolower(n) }
+      NF{
+        v=$1
+        v=tolower(v)
+        sub(/^[[:space:]]+/,"",v); sub(/[[:space:]]+$/,"",v)
+        if (v==n) print
+      }'
+  }
+
+  NODES_METRICS_TSV="$(printf "%s\n" "$NODES_METRICS_TSV" | filter_tsv_to_node)"
+  printf "%s\n" "$NODES_METRICS_TSV" >"$NODES_METRICS_TSV_FILE"
+
+  if [[ -n "$USAGE_MEM_NODE_TSV" ]]; then
+    USAGE_MEM_NODE_TSV="$(printf "%s\n" "$USAGE_MEM_NODE_TSV" | filter_tsv_to_node)"
+    printf "%s\n" "$USAGE_MEM_NODE_TSV" >"$USAGE_MEM_NODE_TSV_FILE"
+  fi
+  if [[ -n "$USAGE_CPU_NODE_TSV" ]]; then
+    USAGE_CPU_NODE_TSV="$(printf "%s\n" "$USAGE_CPU_NODE_TSV" | filter_tsv_to_node)"
+    printf "%s\n" "$USAGE_CPU_NODE_TSV" >"$USAGE_CPU_NODE_TSV_FILE"
+  fi
+
+  if [[ $DEBUG -eq 1 ]]; then
+    echo "DEBUG: Scoped main tables to node: $NODE_FILTER"
+    echo "DEBUG: Nodes remaining after scope:"
+    printf "%s\n" "$NODES_METRICS_TSV" | awk -F'\t' 'NF{print "  " $1}'
+  fi
+fi
+
+# ------------------------ DEBUG PER-POD LIST ------------------------------
+if [[ $DEBUG -eq 1 && -n "$PER_POD_TSV" ]]; then
+  POD_LINES_TOTAL=$(printf "%s\n" "$PER_POD_TSV" | awk 'NF{c++}END{print c+0}')
+  echo "DEBUG: Per-pod requested memory/cpu (matches filters): $POD_LINES_TOTAL pods"
+  if [[ $HAS_USAGE -eq 1 ]]; then
+    echo "DEBUG: (Usage data present via metrics)"
+  fi
+
+  if [[ -n "$NODE_FILTER" ]]; then
+    echo "DEBUG: Node filter for per-pod list: $NODE_FILTER (untruncated)"
+
+    PODS_ON_NODE="$(
+      printf "%s\n" "$PER_POD_TSV" \
+      | awk -F'\t' -v n="$NODE_FILTER" '
+          BEGIN{
+            n=tolower(n)
+            sub(/^[[:space:]]+/,"",n); sub(/[[:space:]]+$/,"",n)
+          }
+          NF{
+            v=$3
+            v=tolower(v)
+            sub(/^[[:space:]]+/,"",v); sub(/[[:space:]]+$/,"",v)
+            if (v==n) c++
+          }
+          END{ print c+0 }'
+    )"
+
+    echo "DEBUG: Pods running on $NODE_FILTER: $PODS_ON_NODE"
+  fi
+
+  echo -n "NAMESPACE/POD                                                 REQ_MEM(Gi)"
+  if [[ $HAS_USAGE -eq 1 ]]; then echo -n "|USAGE_MEM(Gi)"; fi
+  if [[ $SHOW_LIMITS -eq 1 ]]; then echo -n "     |     LIM_MEM(Gi)"; fi
+  echo -n "|REQ_CPU "
+  if [[ $HAS_USAGE -eq 1 ]]; then echo -n "|USAGE_CPU"; fi
+  if [[ $SHOW_LIMITS -eq 1 ]]; then echo -n "     |     LIM_CPU"; fi
+  echo "  [node]"
+  echo "--------------------------------------------------"
+
+  PER_POD_FOR_PRINT="$PER_POD_TSV"
+  if [[ -n "$NODE_FILTER" ]]; then
+    PER_POD_FOR_PRINT="$(
+      printf "%s\n" "$PER_POD_TSV" \
+      | awk -F'\t' -v n="$NODE_FILTER" '
+          BEGIN{
+            n=tolower(n)
+            sub(/^[[:space:]]+/,"",n); sub(/[[:space:]]+$/,"",n)
+          }
+          NF{
+            v=$3
+            v=tolower(v)
+            sub(/^[[:space:]]+/,"",v); sub(/[[:space:]]+$/,"",v)
+            if (v==n) print
+          }'
+    )"
+  fi
+
+  if [[ -n "$NODE_FILTER" || $DEBUG_ALL_PODS -eq 1 ]]; then
+    LIMIT_LINES=99999999
+  else
+    LIMIT_LINES=200
+  fi
+
+  if [[ $HAS_USAGE -eq 1 ]]; then
+    # join mem usage then cpu usage, then print
+    awk -F'\t' 'FNR==NR{um[$1"/"$2]=$3; next} {print $0 "\t" (um[$1"/"$2]?um[$1"/"$2]:"0.00") }' \
+        "$USAGE_MEM_TSV" <(printf "%s\n" "$PER_POD_FOR_PRINT") \
+    | awk -F'\t' 'FNR==NR{uc[$1"/"$2]=$3; next} {print $0 "\t" (uc[$1"/"$2]?uc[$1"/"$2]:"0.000") }' \
+        "$USAGE_CPU_TSV" - \
+    | awk -v show_limits="$SHOW_LIMITS" -v limit="$LIMIT_LINES" -F'\t' '
+        NF{
+          ns=$1; pod=$2; node=$3; rmem=$4; lmem=$5; rcpu=$6; lcpu=$7; umem=$8; ucpu=$9;
+          printf "  %-60s %-9.2f", ns"/"pod, rmem;      # REQ_MEM
+          printf " | %-11.2f", umem;                    # USAGE_MEM
+          if (show_limits==1) printf " | %-10.2f", lmem;# LIM_MEM
+          printf " | %-6.3f", rcpu;                     # REQ_CPU
+          printf " | %-8.3f", ucpu;                     # USAGE_CPU
+          if (show_limits==1) printf " | %-6.3f", lcpu; # LIM_CPU
+          printf "  [%-s]\n", node;
+          if(++c>=limit) exit
+        }' \
+    | sort -k1,1 -k2,2nr
+  else
+    printf "%s\n" "$PER_POD_FOR_PRINT" \
+    | awk -v show_limits="$SHOW_LIMITS" -v max="$LIMIT_LINES" -F'\t' '
+        NF{
+          ns=$1; pod=$2; node=$3; rmem=$4; lmem=$5; rcpu=$6; lcpu=$7;
+          printf "  %-60s %-9.2f", ns"/"pod, rmem;
+          if (show_limits==1) printf " | %-10.2f", lmem;
+          printf " | %-6.3f", rcpu;
+          if (show_limits==1) printf " | %-6.3f", lcpu;
+          printf "  [%-s]\n", node;
+          if(++c>=max) exit
+        }' \
+    | sort -k1,1 -k2,2nr
+  fi
+
+  echo "--------------------------------------------------"
+fi
+
+# ------------------------ MAIN TABLE PRINTING -----------------------------
+if [[ -z "$NODES_METRICS_TSV" || "$NODES_METRICS_TSV" == $'\n' ]]; then
+  echo "No nodes matched filters (vm-only / include-controllers / node-scope-main)." >&2
+  exit 0
+fi
+
+if [[ -z "$NODES_METRICS_TSV" || "$NODES_METRICS_TSV" == $'\n' ]]; then
+  echo "No nodes matched filters (vm-only / include-controllers / node-scope-main)." >&2
+  exit 0
+fi
+
+if [[ $HAS_USAGE -eq 0 ]]; then
+  case "$SORT_COLUMN" in
+    USED%|CPU_USED%|CPU_BOOKED%)
+      echo "WARN: --sort-column $SORT_COLUMN requested, but no usage metrics collected; sorting by NODE instead." >&2
+      SORT_COLUMN="NODE"
+      ;;
+  esac
+fi
+
+if [[ $HAS_USAGE -eq 1 && -s "$USAGE_MEM_NODE_TSV_FILE" ]]; then
+  TITLE="===== Node Resources (Requests vs Allocatable vs Live Usage) ====="
+else
+  TITLE="===== Booked vs Allocatable (Requests only; no live usage metrics) ====="
+fi
+
+echo "$TITLE"
+[[ -n "$NAMESPACE" ]] && echo "Namespace: $NAMESPACE"
+if [[ $NODE_SCOPE_MAIN -eq 1 && -n "$NODE_FILTER" ]]; then
+  echo "(scoped to node: $NODE_FILTER)"
+fi
+
+# Build header line
+header="NODE                STATUS                       ALLOCGi   BOOKEDGi  BOOKED%"
+if [[ $HAS_USAGE -eq 1 ]]; then
+  header="$header USAGEGi   USED%"
+fi
+if [[ $SHOW_CPU -eq 1 ]]; then
+  header="$header   CPU_ALLOC CPU_BOOK  CPU_BOOK%"
+  if [[ $HAS_USAGE -eq 1 ]]; then
+    header="$header  CPU_USE CPU%"
+  fi
+fi
+if [[ $SHOW_NODE_CAPACITY -eq 1 ]]; then
+  header="$header    CPU_CORES  CAPACITY_Gi"
+fi
+echo "$header"
+
+# Color setup (used only when HAS_USAGE=1)
+GRN=$'\033[32m'
+YEL=$'\033[33m'
+RED=$'\033[31m'
+RST=$'\033[0m'
+
+# Decide sort mode for main table
+SORT_MODE="num_desc"
+if [[ "$SORT_COLUMN" == "NODE" ]]; then
+  SORT_MODE="str_asc"
+fi
+
+if [[ $HAS_USAGE -eq 1 ]]; then
+awk -F'\t' \
+    -v has_usage="$HAS_USAGE" \
+    -v sort_column="$SORT_COLUMN" \
+    -v show_cpu="$SHOW_CPU" \
+    -v show_nodecap="$SHOW_NODE_CAPACITY" \
+    -v memUsageFile="$USAGE_MEM_NODE_TSV_FILE" \
+    -v cpuUsageFile="$USAGE_CPU_NODE_TSV_FILE" \
+    -v maxgreen="$MAX_GREEN" \
+    -v maxyellow="$MAX_YELLOW" \
+    -v cgrn="$GRN" -v cyel="$YEL" -v cred="$RED" -v crst="$RST" '
+function colorpct(p,w,   col,s,pad){
+  if      (p <= maxgreen)  col = cgrn;
+  else if (p <= maxyellow) col = cyel;
+  else                     col = cred;
+
+  s   = sprintf("%d",p);
+  pad = w - length(s); if (pad<0) pad=0;
+  return col s crst sprintf("%" pad "s","")
+}
+
+
+    BEGIN{
+      if (has_usage){
+        while ((getline l1 < memUsageFile) > 0){
+          split(l1,a,"\t"); um[a[1]]=a[2]+0
+        }
+        while ((getline l2 < cpuUsageFile) > 0){
+          split(l2,b,"\t"); uc[b[1]]=b[2]+0
+        }
+      }
+    }
+    NF{
+      node=$1; role=$2; status=$3;
+      aGi=$4+0; bGi=$5+0; bPct=$6+0;
+      cAlloc=$7+0; cBook=$8+0; cBookPct=$9+0;
+      cores=$10+0; capGi=$11+0;
+
+      if (has_usage){
+        uGi=(node in um?um[node]:0);
+        uPct=(aGi>0?int((uGi*100)/aGi):0);
+      } else {
+        uGi=0; uPct=0;
+      }
+
+      if (show_cpu){
+        if (has_usage){
+          cUse=(node in uc?uc[node]:0);
+          cPct=(cAlloc>0?int((cUse*100)/cAlloc):0);
+        } else {
+          cUse=0; cPct=0;
+        }
+      } else {
+        cUse=0; cPct=0;
+        cBookPct=0;
+      }
+
+      # Percent strings
+      if (has_usage){
+        bPctS = colorpct(bPct,7);
+        uPctS = colorpct(uPct,7);
+        if (show_cpu){
+          cBookPctS = colorpct(cBookPct,8);
+          cPctS     = colorpct(cPct,8);
+        }
+      } else {
+        bPctS = sprintf("%d",bPct);
+        uPctS = "";  # no USED% without usage
+        if (show_cpu){
+          cBookPctS = sprintf("%d",cBookPct);
+          cPctS     = "";
+        }
+      }
+
+      line = sprintf("%-19s %-28s %-9.2f %-9.2f %-s",
+                     node, status, aGi, bGi, bPctS);
+
+      if (has_usage){
+        line = line sprintf(" %-9.2f %s", uGi, uPctS);
+      }
+
+      if (show_cpu){
+        if (has_usage){
+        line = line sprintf(" %-9.3f %-9.3f %-10s %8.3f %-s",
+                    cAlloc, cBook, cBookPctS, cUse, cPctS);
+        } else {
+          line = line sprintf(" %-10.3f %-10.3f %10-s",
+                              cAlloc, cBook, cBookPctS);
+        }
+      }
+      if (show_nodecap){
+        line = line sprintf(" %-10.0f %-12.2f", cores, capGi);
+      }
+
+      # At this point you should already have:
+      #   bPct   = memory BOOKED% for this node
+      #   uPct   = memory USED%   for this node
+      #   cBookPctS = CPU BOOKED%   (requests vs capacity)
+      #   cPctS = CPU USED%     (usage vs capacity)
+      # and 'node' variable with node name
+
+      # Decide sort key based on sort_column
+      sortKey = node
+      if      (sort_column == "BOOKED%")     sortKey = bPct;
+      else if (sort_column == "USED%")       sortKey = uPct;
+      else if (sort_column == "CPU_BOOKED%") sortKey = cBookPctS;
+      else if (sort_column == "CPU_USED%")   sortKey = cPctS;
+      else if (sort_column == "NODE")        sortKey = node;
+
+      printf "%s\t%s\n", sortKey, line;
+
+
+    }' "$NODES_METRICS_TSV_FILE" \
+  | sort -k1,1nr | cut -f2-
+else
+  # No usage present at all: simpler print, no colors
+  awk -F'\t' \
+    -v sort_column="$SORT_COLUMN" \
+    -v show_cpu="$SHOW_CPU" \
+    -v show_nodecap="$SHOW_NODE_CAPACITY" '
+    NF{
+      node=$1; role=$2; status=$3;
+      aGi=$4+0; bGi=$5+0; bPct=$6+0;
+      cAlloc=$7+0; cBook=$8+0; cBookPct=$9+0;
+      cores=$10+0; capGi=$11+0;
+
+      line = sprintf("%-19s %-28s %-9.2f %-9.2f %9d",
+                     node, status, aGi, bGi, bPct);
+
+      if (show_cpu){
+        line = line sprintf(" %-9.3f %-9.3f %-d", cAlloc, cBook, cBookPct);
+      }
+
+      if (show_nodecap){
+        line = line sprintf(" %-10.0f %-12.2f", cores, capGi);
+      }
+
+      # Decide sort key (in no-usage case, only NODE or BOOKED% make sense)
+      sortKey = node;
+      if (sort_column == "BOOKED%")
+        sortKey = bPct;
+      else if (sort_column == "NODE")
+        sortKey = node;
+
+      printf "%s\t%s\n", sortKey, line;
+    }' "$NODES_METRICS_TSV_FILE" \
+  | { if [[ "$SORT_MODE" == "str_asc" ]]; then sort -k1,1; else sort -k1,1nr; fi; } \
+  | cut -f2-
+fi
+
+# ------------------------ TOTAL / AVG / FREE FOOTER ROWS ------------------------
+
+# Underline escape sequence for footer rows
+UL=$'\033[4m'
+
+# Helper: underline any preformatted value
+underline_val() {
+  local v="$1"
+  printf "%b%s%b" "$UL" "$v" "$RST"
+}
+
+# Helper: underline + color a percentage, using same thresholds as main table
+underline_color_pct() {
+  local p="$1" width="$2" col
+  if (( p <= MAX_GREEN )); then
+    col="$GRN"
+  elif (( p <= MAX_YELLOW )); then
+    col="$YEL"
+  else
+    col="$RED"
+  fi
+  # left-aligned within the given width
+  printf "%b%b%-*d%b" "$UL" "$col" "$width" "$p" "$RST"
+}
+
+# Precompute totals / averages using the node metrics TSV plus per-node usage TSVs
+memUsageArg=""
+cpuUsageArg=""
+if [[ $HAS_USAGE -eq 1 && -s "$USAGE_MEM_NODE_TSV_FILE" ]]; then
+  memUsageArg="$USAGE_MEM_NODE_TSV_FILE"
+fi
+if [[ $HAS_USAGE -eq 1 && -s "$USAGE_CPU_NODE_TSV_FILE" ]]; then
+  cpuUsageArg="$USAGE_CPU_NODE_TSV_FILE"
+fi
+
+TOTALS_LINE="$(
+  awk -F'\t' \
+    -v memUsageFile="$memUsageArg" \
+    -v cpuUsageFile="$cpuUsageArg" '
+BEGIN {
+  if (memUsageFile != "") {
+    while ((getline l1 < memUsageFile) > 0) {
+      split(l1,a,"\t"); um[a[1]] = a[2]+0
+    }
+    close(memUsageFile)
+  }
+  if (cpuUsageFile != "") {
+    while ((getline l2 < cpuUsageFile) > 0) {
+      split(l2,b,"\t"); uc[b[1]] = b[2]+0
+    }
+    close(cpuUsageFile)
+  }
+}
+NF {
+  node     = $1
+  allocGi  = $4+0
+  bookedGi = $5+0
+  bPct     = $6+0
+  allocCpu = $7+0
+  bookedCpu= $8+0
+  cpuBPct  = $9+0
+  cores    = $10+0
+  capGi    = $11+0
+
+  memUsageGi = (node in um ? um[node] : 0)
+  cpuUsage   = (node in uc ? uc[node] : 0)
+
+  usedPct    = (allocGi  > 0 ? int((memUsageGi*100)/allocGi)  : 0)
+  cpuUsedPct = (allocCpu > 0 ? int((cpuUsage*100)/allocCpu)   : 0)
+
+  sumAllocGi      += allocGi
+  sumBookedGi     += bookedGi
+  sumUsageGi      += memUsageGi
+
+  sumAllocCpu     += allocCpu
+  sumBookedCpu    += bookedCpu
+  sumCpuUse       += cpuUsage
+
+  sumCores        += cores
+  sumCapGi        += capGi
+
+  sumBookedPct    += bPct
+  sumUsedPct      += usedPct
+  sumCpuBookedPct += cpuBPct
+  sumCpuUsedPct   += cpuUsedPct
+
+  count++
+}
+END {
+  if (count == 0) count = 1
+  avgBookedPct    = int(sumBookedPct    / count)
+  avgUsedPct      = int(sumUsedPct      / count)
+  avgCpuBookedPct = int(sumCpuBookedPct / count)
+  avgCpuUsedPct   = int(sumCpuUsedPct   / count)
+
+  # ALLOCGi  BOOKEDGi  USAGEGi  CPU_ALLOC  CPU_BOOK  CPU_USE  CPU_CORES  CAPACITY_Gi
+  # BOOKED%  USED%  CPU_BOOK%  CPU_USED%
+  printf "%.2f\t%.2f\t%.2f\t%.3f\t%.3f\t%.3f\t%.0f\t%.2f\t%d\t%d\t%d\t%d\n",
+         sumAllocGi, sumBookedGi, sumUsageGi,
+         sumAllocCpu, sumBookedCpu, sumCpuUse,
+         sumCores,    sumCapGi,
+         avgBookedPct, avgUsedPct, avgCpuBookedPct, avgCpuUsedPct
+}
+' "$NODES_METRICS_TSV_FILE"
+)"
+
+IFS=$'\t' read -r \
+  TOT_ALLOC_GI TOT_BOOKED_GI TOT_USAGE_GI \
+  TOT_CPU_ALLOC TOT_CPU_BOOK TOT_CPU_USE \
+  TOT_CPU_CORES TOT_CAP_GI \
+  AVG_BOOKED_PCT AVG_USED_PCT AVG_CPU_BOOKED_PCT AVG_CPU_USED_PCT \
+  <<< "$TOTALS_LINE"
+
+# --------- Print TOTAL/AVG row (left aligned, underlined, colored %s) -----
+echo
+
+# NODE + STATUS
+printf "%-19s %-28s " "TOTAL/AVG" ""
+
+# ALLOCGi, BOOKEDGi
+printf "%s " "$(underline_val "$(printf "%-9.2f" "$TOT_ALLOC_GI")")"
+printf "%s " "$(underline_val "$(printf "%-9.2f" "$TOT_BOOKED_GI")")"
+
+if [[ $HAS_USAGE -eq 1 ]]; then
+  # BOOKED%
+  underline_color_pct "$AVG_BOOKED_PCT" 7
+
+  # USAGEGi, USED%
+  printf " %s " "$(underline_val "$(printf "%-9.2f" "$TOT_USAGE_GI")")"
+  underline_color_pct "$AVG_USED_PCT" 7
+else
+  # No live usage: only BOOKED%
+  underline_color_pct "$AVG_BOOKED_PCT" 7
+fi
+
+if [[ $SHOW_CPU -eq 1 ]]; then
+  if [[ $HAS_USAGE -eq 1 ]]; then
+    # CPU_ALLOC, CPU_BOOK
+    printf " %s " "$(underline_val "$(printf "%-9.3f" "$TOT_CPU_ALLOC")")"
+    printf "%s "  "$(underline_val "$(printf "%-9.3f" "$TOT_CPU_BOOK")")"
+
+    # CPU_BOOK%, CPU_USE, CPU%
+    underline_color_pct "$AVG_CPU_BOOKED_PCT" 8
+    printf " %s "  "$(underline_val "$(printf "%-8.3f" "$TOT_CPU_USE")")"
+    underline_color_pct "$AVG_CPU_USED_PCT" 8
+  else
+    # No usage CPU columns
+    printf " %s " "$(underline_val "$(printf "%-9.3f" "$TOT_CPU_ALLOC")")"
+    printf "%s "  "$(underline_val "$(printf "%-9.3f" "$TOT_CPU_BOOK")")"
+    underline_color_pct "$AVG_CPU_BOOKED_PCT" 3
+  fi
+fi
+
+if [[ $SHOW_NODE_CAPACITY -eq 1 ]]; then
+  # CPU_CORES, CAPACITY_Gi
+  printf " %s " "$(underline_val "$(printf "%-10.0f" "$TOT_CPU_CORES")")"
+  printf "%s"   "$(underline_val "$(printf "%-12.2f" "$TOT_CAP_GI")")"
+fi
+
+echo         # end TOTAL/AVG row
+echo         # blank line before FREE row
+
+# --------- FREE row (BOOKED - ALLOC as requested) -------------------------
+
+# Memory: FREE = ALLOCGi - BOOKEDGi
+FREE_GI=$(awk -v booked="$TOT_BOOKED_GI" -v alloc="$TOT_ALLOC_GI" 'BEGIN{printf "%.2f", alloc-booked}')
+
+# CPU: FREE = CPU_ALLOC - CPU_BOOK
+FREE_CPU=""
+if [[ $SHOW_CPU -eq 1 ]]; then
+  FREE_CPU=$(awk -v booked="$TOT_CPU_BOOK" -v alloc="$TOT_CPU_ALLOC" 'BEGIN{printf "%.3f", alloc-booked}')
+fi
+
+
+
+# NODE + STATUS
+printf "%-19s %-28s " "FREE" ""
+
+# ALLOCGi blank, FREE mem shown in BOOKEDGi column
+printf "%-9s " ""
+printf "%s " "$(underline_val "$(printf "%-9.2f" "$FREE_GI")")"
+
+if [[ $HAS_USAGE -eq 1 ]]; then
+  # BOOKED%, USAGEGi, USED% left blank for FREE row
+  printf "%-7s " ""   # BOOKED%
+  printf "%-9s " ""   # USAGEGi
+  printf "%-7s"  ""   # USED%
+else
+  printf "%-7s" ""    # BOOKED% blank in no-usage mode
+fi
+
+if [[ $SHOW_CPU -eq 1 ]]; then
+  if [[ $HAS_USAGE -eq 1 ]]; then
+    # CPU_ALLOC blank
+    printf " %-9s " ""
+
+    # FREE CPU in CPU_BOOK column
+    printf "%s " "$(underline_val "$(printf "%-9.3f" "$FREE_CPU")")"
+
+    # CPU_BOOK%, CPU_USE, CPU% blank
+    printf "%-8s " ""  # CPU_BOOK%
+    printf "%-8s " ""  # CPU_USE
+    printf "%-8s"  ""  # CPU%
+  else
+    # No usage: only show FREE CPU in CPU_BOOK col
+    printf " %-9s " ""
+    printf "%s " "$(underline_val "$(printf "%-9.3f" "$FREE_CPU")")"
+    printf "%-3s"  ""  # CPU_BOOK%
+  fi
+fi
+
+if [[ $SHOW_NODE_CAPACITY -eq 1 ]]; then
+  # CPU_CORES, CAPACITY_Gi blank in FREE row
+  printf " %-10s " ""
+  printf "%-12s" ""
+fi
+
+echo
