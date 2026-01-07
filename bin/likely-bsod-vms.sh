@@ -4,9 +4,12 @@ set -euo pipefail
 WINDOW="${WINDOW:-10m}"
 TOP_N="${TOP_N:-20}"
 MODE="${MODE:-top}"            # top | wedge
-THRESH_PCT="${THRESH_PCT:-90}" # for MODE=wedge
+THRESH_PCT="${THRESH_PCT:-90}" # wedge: CPU%
 NET_MAX_BPS="${NET_MAX_BPS:-50000}"
 DISK_MAX_BPS="${DISK_MAX_BPS:-50000}"
+# Optional thresholds for refinement (wedge mode)
+IOWAIT_MIN_CORES="${IOWAIT_MIN_CORES:-0}"  # e.g. 0.1 means at least 0.1 cores waiting
+DELAY_MIN_CORES="${DELAY_MIN_CORES:-0}"    # e.g. 0.1 means at least 0.1 cores delayed
 DEBUG=0
 INSPECT_NS=""
 INSPECT_VMI=""
@@ -17,6 +20,10 @@ Usage:
   $0 --top 20 --window 10m [--debug]
   MODE=wedge TOP_N=200 THRESH_PCT=90 NET_MAX_BPS=50000 DISK_MAX_BPS=50000 $0 --window 10m
   $0 --inspect <namespace> <vmi> [--window 10m]
+
+Extra wedge refinements:
+  IOWAIT_MIN_CORES=0.1 DELAY_MIN_CORES=0.05 MODE=wedge ... $0
+
 EOF
 }
 
@@ -71,7 +78,7 @@ pick_free_port() {
 mon_post() {
   local q="$1"
   curl --ipv4 --http1.1 -ksS \
-    --connect-timeout 2 --max-time 30 \
+    --connect-timeout 2 --max-time 35 \
     -H "Authorization: Bearer ${TOKEN}" \
     "https://127.0.0.1:${PF_PORT}/api/v1/query" \
     --data-urlencode "query=${q}"
@@ -131,6 +138,8 @@ if [[ -n "${INSPECT_NS:-}" && -n "${INSPECT_VMI:-}" ]]; then
 
   QUERIES=(
     "CPU: kubevirt_vmi_cpu_usage_seconds_total{namespace=\"${INSPECT_NS}\",name=\"${INSPECT_VMI}\"}"
+    "IOWAIT: kubevirt_vmi_vcpu_wait_seconds_total{namespace=\"${INSPECT_NS}\",name=\"${INSPECT_VMI}\"}"
+    "DELAY: kubevirt_vmi_vcpu_delay_seconds_total{namespace=\"${INSPECT_NS}\",name=\"${INSPECT_VMI}\"}"
     "NET RX: kubevirt_vmi_network_receive_bytes_total{namespace=\"${INSPECT_NS}\",name=\"${INSPECT_VMI}\"}"
     "NET TX: kubevirt_vmi_network_transmit_bytes_total{namespace=\"${INSPECT_NS}\",name=\"${INSPECT_VMI}\"}"
     "DISK RD: kubevirt_vmi_storage_read_traffic_bytes_total{namespace=\"${INSPECT_NS}\",name=\"${INSPECT_VMI}\"}"
@@ -170,14 +179,20 @@ WANTED_KEYS_JSON="$(jq -Rn --arg s "$TOP_LIST_TSV" '
   | reduce $lines[] as $l ({}; ($l|split("\t")) as $p | . + { ($p[0]+"/"+$p[1]): ($p[2]|tonumber) })
 ')"
 
-# ---- Wedge maps: query cluster-wide aggregated series (no regex) ----
+# ---- Supporting maps (cluster-wide aggregated by namespace,name) ----
+to_map='
+  .data.result
+  | reduce .[] as $r ({}; . + { (($r.metric.namespace + "/" + $r.metric.name)): ($r.value[1]|tonumber) })
+'
+
+# Always fetch iowait/delay (cheap and useful even in top mode)
+IOW_JSON="$(mon_post "sum by (namespace, name) (rate(kubevirt_vmi_vcpu_wait_seconds_total[${WINDOW}]))" 2>/dev/null || echo '{"status":"success","data":{"result":[]}}')"
+DLY_JSON="$(mon_post "sum by (namespace, name) (irate(kubevirt_vmi_vcpu_delay_seconds_total[${WINDOW}]))" 2>/dev/null || echo '{"status":"success","data":{"result":[]}}')"
+IOW_MAP="$(jq -c "$to_map" <<<"$IOW_JSON" 2>/dev/null || echo '{}')"
+DLY_MAP="$(jq -c "$to_map" <<<"$DLY_JSON" 2>/dev/null || echo '{}')"
+
 RX_MAP="{}"; TX_MAP="{}"; RD_MAP="{}"; WR_MAP="{}"
 if [[ "$MODE" == "wedge" ]]; then
-  to_map='
-    .data.result
-    | reduce .[] as $r ({}; . + { (($r.metric.namespace + "/" + $r.metric.name)): ($r.value[1]|tonumber) })
-  '
-
   RX_JSON="$(mon_post "sum by (namespace, name) (rate(kubevirt_vmi_network_receive_bytes_total[${WINDOW}]))" 2>/dev/null || echo '{"status":"success","data":{"result":[]}}')"
   TX_JSON="$(mon_post "sum by (namespace, name) (rate(kubevirt_vmi_network_transmit_bytes_total[${WINDOW}]))" 2>/dev/null || echo '{"status":"success","data":{"result":[]}}')"
   RD_JSON="$(mon_post "sum by (namespace, name) (rate(kubevirt_vmi_storage_read_traffic_bytes_total[${WINDOW}]))" 2>/dev/null || echo '{"status":"success","data":{"result":[]}}')"
@@ -196,54 +211,93 @@ if [[ "$MODE" == "wedge" ]]; then
   }
 fi
 
+[[ "$DEBUG" -eq 1 ]] && {
+  echo "DEBUG: iowait entries: $(jq 'length' <<<"$IOW_MAP")" >&2
+  echo "DEBUG: delay entries: $(jq 'length' <<<"$DLY_MAP")" >&2
+}
+
 VMI_JSON="$(oc get "${VMI_RES}" -A -o json)"
 
 echo "Monitoring: svc/${PF_SVC} via https://127.0.0.1:${PF_PORT}"
 echo "Mode=${MODE} Window=${WINDOW} Top=${TOP_N}"
 if [[ "$MODE" == "wedge" ]]; then
-  echo "Wedge filters: CPU>=${THRESH_PCT}% net<=${NET_MAX_BPS}B/s disk<=${DISK_MAX_BPS}B/s"
+  echo "Wedge filters: CPU>=${THRESH_PCT}% net<=${NET_MAX_BPS}B/s disk<=${DISK_MAX_BPS}B/s iowait>=${IOWAIT_MIN_CORES} delay>=${DELAY_MIN_CORES}"
 fi
 echo
 
-HEADER=$'NODE\tNAMESPACE\tVMI\tVM(owner)\tvCPU\tCPU(cores)\tCPU(%)\tNET(B/s)\tDISK(B/s)'
+HEADER=$'SCORE\tNODE\tNAMESPACE\tVMI\tVM(owner)\tvCPU\tCPU(%)\tCPU(cores)\tIOWAIT(cores)\tDELAY(cores)\tNET(B/s)\tDISK(B/s)'
 printf "%s\n" "$HEADER" | (command -v column >/dev/null 2>&1 && column -t -s $'\t' || cat)
 
 jq -r --argjson wanted "$WANTED_KEYS_JSON" \
       --argjson rx "$RX_MAP" --argjson tx "$TX_MAP" --argjson rd "$RD_MAP" --argjson wr "$WR_MAP" \
-      --arg mode "$MODE" --arg thresh "$THRESH_PCT" --arg netmax "$NET_MAX_BPS" --arg diskmax "$DISK_MAX_BPS" '
+      --argjson iow "$IOW_MAP" --argjson dly "$DLY_MAP" \
+      --arg mode "$MODE" --arg thresh "$THRESH_PCT" --arg netmax "$NET_MAX_BPS" --arg diskmax "$DISK_MAX_BPS" \
+      --arg iowmin "$IOWAIT_MIN_CORES" --arg dlymin "$DELAY_MIN_CORES" '
   def vcpu_count(v):
     ((v.spec.domain.cpu.cores // 1) *
      (v.spec.domain.cpu.sockets // 1) *
      (v.spec.domain.cpu.threads // 1));
   def pct(a;b): if b <= 0 then 0 else (a / b * 100) end;
 
-  .items[]
-  | (.metadata.namespace + "/" + .metadata.name) as $k
-  | ($wanted[$k] // null) as $cpuCores
-  | select($cpuCores != null)
-  | (.status.nodeName // "") as $node
-  | select($node != "")
-  | (vcpu_count(.)|tonumber) as $vcpus
-  | (pct($cpuCores; $vcpus)) as $cpuPct
-  | (($rx[$k] // 0) + ($tx[$k] // 0)) as $netBps
-  | (($rd[$k] // 0) + ($wr[$k] // 0)) as $diskBps
-  | ( ((.metadata.ownerReferences // []) | map(select(.kind=="VirtualMachine"))[0].name) // "" ) as $vmOwner
-  | if $mode == "wedge" then
-      select($cpuPct >= ($thresh|tonumber))
-      | select($netBps <= ($netmax|tonumber))
-      | select($diskBps <= ($diskmax|tonumber))
-    else .
-    end
+  # Simple score: emphasize CPU% and also add wait/delay pressure
+  def score(cpuPct; iow; dly):
+    (cpuPct) + (iow*50) + (dly*50);
+
+  [
+    .items[]
+    | (.metadata.namespace + "/" + .metadata.name) as $k
+    | ($wanted[$k] // null) as $cpuCores
+    | select($cpuCores != null)
+    | (.status.nodeName // "") as $node
+    | select($node != "")
+    | (vcpu_count(.)|tonumber) as $vcpus
+    | (pct($cpuCores; $vcpus)) as $cpuPct
+    | (($rx[$k] // 0) + ($tx[$k] // 0)) as $netBps
+    | (($rd[$k] // 0) + ($wr[$k] // 0)) as $diskBps
+    | ($iow[$k] // 0) as $iowCores
+    | ($dly[$k] // 0) as $dlyCores
+    | ( ((.metadata.ownerReferences // []) | map(select(.kind=="VirtualMachine"))[0].name) // "" ) as $vmOwner
+    | (score($cpuPct; $iowCores; $dlyCores)) as $score
+    | {
+        score: $score,
+        node: $node,
+        ns: .metadata.namespace,
+        vmi: .metadata.name,
+        owner: $vmOwner,
+        vcpus: $vcpus,
+        cpuPct: $cpuPct,
+        cpuCores: $cpuCores,
+        iow: $iowCores,
+        dly: $dlyCores,
+        net: $netBps,
+        disk: $diskBps
+      }
+  ] as $rows
+  | (
+      if $mode == "wedge" then
+        $rows
+        | map(select(.cpuPct >= ($thresh|tonumber)))
+        | map(select(.net <= ($netmax|tonumber)))
+        | map(select(.disk <= ($diskmax|tonumber)))
+        # optional refinements (only apply if >0)
+        | (if ($iowmin|tonumber) > 0 then map(select(.iow >= ($iowmin|tonumber))) else . end)
+        | (if ($dlymin|tonumber) > 0 then map(select(.dly >= ($dlymin|tonumber))) else . end)
+      else
+        $rows
+      end
+    )
+  | sort_by(-.score)
+  | .[]
   | [
-      $node,
-      .metadata.namespace,
-      .metadata.name,
-      $vmOwner,
-      ($vcpus|tostring),
-      ($cpuCores|tostring),
-      ($cpuPct|tostring),
-      ($netBps|tostring),
-      ($diskBps|tostring)
+      (.score|tostring),
+      .node, .ns, .vmi, .owner,
+      (.vcpus|tostring),
+      (.cpuPct|tostring),
+      (.cpuCores|tostring),
+      (.iow|tostring),
+      (.dly|tostring),
+      (.net|tostring),
+      (.disk|tostring)
     ] | @tsv
 ' <<<"$VMI_JSON" \
 | (command -v column >/dev/null 2>&1 && column -t -s $'\t' || cat)
