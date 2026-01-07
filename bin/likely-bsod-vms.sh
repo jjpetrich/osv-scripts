@@ -15,11 +15,12 @@ DEFAULT_DISK_MAX_BPS=20000
 DEFAULT_IOWAIT_MIN_CORES=0
 DEFAULT_DELAY_MIN_CORES=0
 
-DEFAULT_STEADY=1
+DEFAULT_STEADY=1              # 1=use steady refinement in wedge mode
 DEFAULT_JITTER_MAX_PCT=15
 DEFAULT_PEAKAVG_MAX_PCT=15
+DEFAULT_STEADY_ONLY=0         # 1=require steady (even in top), 0=just use for wedge filtering if steady=1
 
-DEFAULT_LIMIT=0
+DEFAULT_LIMIT=0               # 0=unlimited
 
 # -----------------------------
 # Parsed args -> variables
@@ -35,6 +36,7 @@ DELAY_MIN_CORES="$DEFAULT_DELAY_MIN_CORES"
 STEADY="$DEFAULT_STEADY"
 JITTER_MAX_PCT="$DEFAULT_JITTER_MAX_PCT"
 PEAKAVG_MAX_PCT="$DEFAULT_PEAKAVG_MAX_PCT"
+STEADY_ONLY="$DEFAULT_STEADY_ONLY"
 LIMIT="$DEFAULT_LIMIT"
 DEBUG=0
 INSPECT_NS=""
@@ -45,8 +47,8 @@ usage() {
 likely-bsod-vms.sh
 
 Modes:
-  --mode wedge   (default) High avg CPU% + low net + low disk + (optionally) steady CPU, iowait/delay thresholds
-  --mode top     Show top VMIs by avg CPU% (no wedge filtering)
+  --mode wedge   (default) High avg CPU% + low net + low disk + (optionally) steady CPU filters
+  --mode top     Show top VMIs by avg CPU% (still includes NET/DISK and steady stats)
 
 Defaults (override via flags):
   --window $DEFAULT_WINDOW
@@ -57,6 +59,7 @@ Defaults (override via flags):
   --steady / --no-steady
   --jitter-max $DEFAULT_JITTER_MAX_PCT
   --peakavg-max $DEFAULT_PEAKAVG_MAX_PCT
+  --steady-only / --no-steady-only
   --iowait-min $DEFAULT_IOWAIT_MIN_CORES
   --delay-min $DEFAULT_DELAY_MIN_CORES
   --limit $DEFAULT_LIMIT   (0 = unlimited)
@@ -86,6 +89,8 @@ while [[ $# -gt 0 ]]; do
     --no-steady) STEADY=0; shift 1;;
     --jitter-max) JITTER_MAX_PCT="$2"; shift 2;;
     --peakavg-max) PEAKAVG_MAX_PCT="$2"; shift 2;;
+    --steady-only) STEADY_ONLY=1; shift 1;;
+    --no-steady-only) STEADY_ONLY=0; shift 1;;
     --limit) LIMIT="$2"; shift 2;;
     --inspect) INSPECT_NS="$2"; INSPECT_VMI="$3"; shift 3;;
     --debug) DEBUG=1; shift 1;;
@@ -196,7 +201,6 @@ if [[ -n "${INSPECT_NS:-}" && -n "${INSPECT_VMI:-}" ]]; then
   echo "Monitoring: svc/${PF_SVC} via https://127.0.0.1:${PF_PORT}"
   echo "Inspecting labels for ${INSPECT_NS}/${INSPECT_VMI} over WINDOW=${WINDOW}"
   echo
-
   QUERIES=(
     "CPU: kubevirt_vmi_cpu_usage_seconds_total{namespace=\"${INSPECT_NS}\",name=\"${INSPECT_VMI}\"}"
     "IOWAIT: kubevirt_vmi_vcpu_wait_seconds_total{namespace=\"${INSPECT_NS}\",name=\"${INSPECT_VMI}\"}"
@@ -226,8 +230,6 @@ fi
 # PromQL building blocks
 # -----------------------------
 CPU_CORES_EXPR="sum by (namespace, name) (rate(kubevirt_vmi_cpu_usage_seconds_total[${WINDOW}]))"
-
-# Use SUBQUERY form [WINDOW:] which is allowed on expressions
 CPU_AVG_CORES_Q="avg_over_time((${CPU_CORES_EXPR})[${WINDOW}:])"
 CPU_MAX_CORES_Q="max_over_time((${CPU_CORES_EXPR})[${WINDOW}:])"
 CPU_STD_CORES_Q="stddev_over_time((${CPU_CORES_EXPR})[${WINDOW}:])"
@@ -261,20 +263,18 @@ CPU_STD_MAP="$(mon_post "${CPU_STD_CORES_Q}" | jq -c "$to_map" 2>/dev/null || ec
 IOW_MAP="$(mon_post "sum by (namespace, name) (rate(kubevirt_vmi_vcpu_wait_seconds_total[${WINDOW}]))" | jq -c "$to_map" 2>/dev/null || echo '{}')"
 DLY_MAP="$(mon_post "sum by (namespace, name) (irate(kubevirt_vmi_vcpu_delay_seconds_total[${WINDOW}]))" | jq -c "$to_map" 2>/dev/null || echo '{}')"
 
-RX_MAP="{}"; TX_MAP="{}"; RD_MAP="{}"; WR_MAP="{}"
-if [[ "$MODE" == "wedge" ]]; then
-  RX_MAP="$(mon_post "sum by (namespace, name) (rate(kubevirt_vmi_network_receive_bytes_total[${WINDOW}]))" | jq -c "$to_map" 2>/dev/null || echo '{}')"
-  TX_MAP="$(mon_post "sum by (namespace, name) (rate(kubevirt_vmi_network_transmit_bytes_total[${WINDOW}]))" | jq -c "$to_map" 2>/dev/null || echo '{}')"
-  RD_MAP="$(mon_post "sum by (namespace, name) (rate(kubevirt_vmi_storage_read_traffic_bytes_total[${WINDOW}]))" | jq -c "$to_map" 2>/dev/null || echo '{}')"
-  WR_MAP="$(mon_post "sum by (namespace, name) (rate(kubevirt_vmi_storage_write_traffic_bytes_total[${WINDOW}]))" | jq -c "$to_map" 2>/dev/null || echo '{}')"
-fi
+# Always query net/disk so top mode shows real values too
+RX_MAP="$(mon_post "sum by (namespace, name) (rate(kubevirt_vmi_network_receive_bytes_total[${WINDOW}]))" | jq -c "$to_map" 2>/dev/null || echo '{}')"
+TX_MAP="$(mon_post "sum by (namespace, name) (rate(kubevirt_vmi_network_transmit_bytes_total[${WINDOW}]))" | jq -c "$to_map" 2>/dev/null || echo '{}')"
+RD_MAP="$(mon_post "sum by (namespace, name) (rate(kubevirt_vmi_storage_read_traffic_bytes_total[${WINDOW}]))" | jq -c "$to_map" 2>/dev/null || echo '{}')"
+WR_MAP="$(mon_post "sum by (namespace, name) (rate(kubevirt_vmi_storage_write_traffic_bytes_total[${WINDOW}]))" | jq -c "$to_map" 2>/dev/null || echo '{}')"
 
 VMI_JSON="$(oc get "${VMI_RES}" -A -o json)"
 
 echo "Monitoring: svc/${PF_SVC} via https://127.0.0.1:${PF_PORT}"
 echo "Mode=${MODE} Window=${WINDOW} TopCandidates=${TOP_N}"
 if [[ "$MODE" == "wedge" ]]; then
-  echo "Filters: CPU>=${CPU_MIN_PCT}% net<=${NET_MAX_BPS} disk<=${DISK_MAX_BPS} steady=${STEADY} jitter<=${JITTER_MAX_PCT}% peak-avg<=${PEAKAVG_MAX_PCT}% iowait>=${IOWAIT_MIN_CORES} delay>=${DELAY_MIN_CORES}"
+  echo "Filters: CPU>=${CPU_MIN_PCT}% net<=${NET_MAX_BPS} disk<=${DISK_MAX_BPS} steady=${STEADY} steady-only=${STEADY_ONLY} jitter<=${JITTER_MAX_PCT}% peak-avg<=${PEAKAVG_MAX_PCT}% iowait>=${IOWAIT_MIN_CORES} delay>=${DELAY_MIN_CORES}"
 fi
 echo
 
@@ -292,6 +292,7 @@ jq -r \
   --arg netMax "$NET_MAX_BPS" \
   --arg diskMax "$DISK_MAX_BPS" \
   --arg steady "$STEADY" \
+  --arg steadyOnly "$STEADY_ONLY" \
   --arg jitterMax "$JITTER_MAX_PCT" \
   --arg peakavgMax "$PEAKAVG_MAX_PCT" \
   --arg iowMin "$IOWAIT_MIN_CORES" \
@@ -306,13 +307,20 @@ jq -r \
   def f2(x): (x|tonumber) as $v | ( ($v*100 | round) / 100 );
   def i0(x): (x|tonumber | round);
 
-  def score(avgPct; net; disk; jitter; peakavg; iow; dly):
+  # Normalize helper: maps values into 0..1 where 1 is "more suspicious"
+  def clamp01(x): if x < 0 then 0 elif x > 1 then 1 else x end;
+
+  # Suspicion score ~ 0..120
+  # - base = avg CPU%
+  # - + quiet bonus if net/disk are below thresholds
+  # - + steady bonus if jitter/peakavg are low
+  def score(avgPct; net; disk; jitter; peakavg; iow; dly; netThr; diskThr; jitThr; peakThr):
     (avgPct)
-    + ( (20000 - (net|tonumber)) / 4000 )
-    + ( (20000 - (disk|tonumber)) / 4000 )
-    + ( (15 - (jitter|tonumber)) / 2 )
-    + ( (15 - (peakavg|tonumber)) / 2 )
-    + (iow*20) + (dly*20);
+    + 20 * clamp01((netThr - net) / netThr)
+    + 20 * clamp01((diskThr - disk) / diskThr)
+    + 10 * clamp01((jitThr - jitter) / jitThr)
+    + 10 * clamp01((peakThr - peakavg) / peakThr)
+    + (iow*10) + (dly*10);
 
   [
     .items[]
@@ -340,7 +348,10 @@ jq -r \
 
     | ( ((.metadata.ownerReferences // []) | map(select(.kind=="VirtualMachine"))[0].name) // "" ) as $vmOwner
 
-    | (score($avgPct; $netBps; $diskBps; $jitterPct; $peakavgPct; $iowC; $dlyC)) as $score
+    | (score(
+        $avgPct; $netBps; $diskBps; $jitterPct; $peakavgPct; $iowC; $dlyC;
+        ($netMax|tonumber); ($diskMax|tonumber); ($jitterMax|tonumber); ($peakavgMax|tonumber)
+      )) as $score
 
     | {
         score:$score, node:$node, ns:.metadata.namespace, vmi:.metadata.name, owner:$vmOwner,
@@ -370,6 +381,11 @@ jq -r \
         $rows
       end
     )
+  | (if ($steadyOnly|tonumber) == 1 then
+       map(select(.jitter <= ($jitterMax|tonumber)))
+       | map(select(.peakavg <= ($peakavgMax|tonumber)))
+     else .
+     end)
   | sort_by(-.score)
   | (if ($limit|tonumber) > 0 then .[0:($limit|tonumber)] else . end)
   | .[]
