@@ -1,14 +1,29 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-WINDOW="${WINDOW:-5m}"
+# likely-bsod-vms.sh
+# Heuristic: VMIs with sustained high CPU usage (>= THRESH_PCT% of vCPU) over WINDOW.
+# Cluster-wide; includes NODE so you can group by worker.
+#
+# Monitoring access:
+#   Default: port-forward to openshift-monitoring svc/thanos-querier:9091 (fallback prometheus-k8s:9091)
+#   Optional: enable service-proxy probing by setting TRY_SERVICE_PROXY=1 (default 0)
+#
+# Requires: oc, jq, curl
+
+WINDOW="${WINDOW:-10m}"
 THRESH_PCT="${THRESH_PCT:-90}"
 DEBUG=0
+TRY_SERVICE_PROXY="${TRY_SERVICE_PROXY:-0}"
 
 usage() {
   cat <<EOF
-Usage: $0 [--window 5m] [--threshold 90] [--debug]
-Env: WINDOW, THRESH_PCT
+Usage: $0 [--window 10m] [--threshold 90] [--debug]
+
+Env:
+  WINDOW=10m
+  THRESH_PCT=90
+  TRY_SERVICE_PROXY=0   (set to 1 to try openshift-monitoring service proxy first)
 EOF
 }
 
@@ -26,7 +41,6 @@ need() { command -v "$1" >/dev/null 2>&1 || { echo "Missing dependency: $1" >&2;
 need oc
 need jq
 need curl
-need python3
 
 if ! oc whoami >/dev/null 2>&1; then
   echo "ERROR: Not logged in. Run: oc login --web" >&2
@@ -37,7 +51,7 @@ fi
 # Detect VMI resource name
 # -------------------------
 detect_vmi_resource() {
-  local candidates=("vmi" "virtualmachineinstances" "virtualmachineinstance")
+  local candidates=("virtualmachineinstances" "vmi" "virtualmachineinstance")
   local r
   for r in "${candidates[@]}"; do
     if oc get "$r" -A --request-timeout=5s >/dev/null 2>&1; then
@@ -51,53 +65,40 @@ detect_vmi_resource() {
 VMI_RES="$(detect_vmi_resource || true)"
 if [[ -z "${VMI_RES:-}" ]]; then
   cat >&2 <<'EOF'
-ERROR: Could not find a VirtualMachineInstance (VMI) API resource in this cluster.
-
+ERROR: No VirtualMachineInstance API resource found.
 Run:
-  oc api-resources | egrep -i 'kubevirt|virtualmachineinstance|virtualmachine\b|vmi\b'
-  oc get virtualmachineinstances -A
-
-If OpenShift Virtualization/KubeVirt is not installed on this cluster, there is no VMI to query.
+  oc api-resources | egrep -i 'virtualmachineinstances|vmi|kubevirt'
 EOF
   exit 1
 fi
 
-[[ "$DEBUG" -eq 1 ]] && echo "DEBUG: using VMI resource: ${VMI_RES}" >&2
-
 # -------------------------
-# Monitoring backend (proxy or port-forward)
+# Monitoring query helpers
 # -------------------------
 uri_encode() { jq -rn --arg v "$1" '$v|@uri'; }
 
+# Service-proxy bases (optional)
 PROXY_BASES=(
-  "/api/v1/namespaces/openshift-monitoring/services/https:thanos-querier:9091/proxy"
   "/api/v1/namespaces/openshift-monitoring/services/thanos-querier:9091/proxy"
-  "/api/v1/namespaces/openshift-monitoring/services/https:prometheus-k8s:9091/proxy"
+  "/api/v1/namespaces/openshift-monitoring/services/https:thanos-querier:9091/proxy"
   "/api/v1/namespaces/openshift-monitoring/services/prometheus-k8s:9091/proxy"
+  "/api/v1/namespaces/openshift-monitoring/services/https:prometheus-k8s:9091/proxy"
 )
 
-proxy_runtimeinfo_ok() {
+proxy_query() {
+  local base="$1" q="$2"
+  local enc; enc="$(uri_encode "$q")"
+  oc -n openshift-monitoring get --raw "${base}/api/v1/query?query=${enc}" 2>/dev/null || true
+}
+
+proxy_works() {
   local base="$1"
   local out
-  if out="$(oc -n openshift-monitoring get --raw "${base}/api/v1/status/runtimeinfo" 2>/dev/null)"; then
-    jq -e '.status=="success"' >/dev/null 2>&1 <<<"$out"
-  else
-    return 1
-  fi
+  out="$(oc -n openshift-monitoring get --raw "${base}/api/v1/query?query=$(uri_encode up)" 2>/dev/null || true)"
+  jq -e '.status=="success"' >/dev/null 2>&1 <<<"$out"
 }
 
-pick_proxy_base() {
-  local base
-  for base in "${PROXY_BASES[@]}"; do
-    if proxy_runtimeinfo_ok "$base"; then
-      echo "$base"
-      return 0
-    fi
-  done
-  return 1
-}
-
-PROM_MODE=""   # "proxy" or "pf"
+PROM_MODE=""     # proxy|pf
 PROXY_BASE=""
 PF_PID=""
 PF_LOCAL_PORT=""
@@ -105,22 +106,32 @@ PF_LOCAL_PORT=""
 cleanup_pf() { [[ -n "${PF_PID:-}" ]] && kill "${PF_PID}" >/dev/null 2>&1 || true; }
 trap cleanup_pf EXIT
 
+pick_free_port() {
+  # simple random-ish port; retry a few times
+  local p i
+  for i in {1..20}; do
+    p=$(( (RANDOM % 15000) + 20000 ))
+    # quick check: if curl fails, port likely free; good enough for this use
+    if ! curl -fsS "http://127.0.0.1:${p}/" >/dev/null 2>&1; then
+      echo "$p"
+      return 0
+    fi
+  done
+  echo 29091
+}
+
 start_port_forward() {
-  local svc="$1"
-  local rport="$2"
-  PF_LOCAL_PORT="$(python3 - <<'PY'
-import random
-print(random.randint(20000, 40000))
-PY
-)"
+  local svc="$1" rport="$2"
+  PF_LOCAL_PORT="$(pick_free_port)"
+
   [[ "$DEBUG" -eq 1 ]] && echo "DEBUG: port-forward svc/${svc} ${PF_LOCAL_PORT}:${rport}" >&2
 
   oc -n openshift-monitoring port-forward "svc/${svc}" "${PF_LOCAL_PORT}:${rport}" >/dev/null 2>&1 &
   PF_PID="$!"
 
   local i
-  for i in {1..25}; do
-    if curl -fsS "http://127.0.0.1:${PF_LOCAL_PORT}/api/v1/status/runtimeinfo" >/dev/null 2>&1; then
+  for i in {1..30}; do
+    if curl -fsS "http://127.0.0.1:${PF_LOCAL_PORT}/api/v1/query?query=up" >/dev/null 2>&1; then
       return 0
     fi
     sleep 0.2
@@ -132,31 +143,6 @@ PY
   return 1
 }
 
-if PROXY_BASE="$(pick_proxy_base || true)"; then
-  PROM_MODE="proxy"
-else
-  if start_port_forward "thanos-querier" "9091"; then
-    PROM_MODE="pf"
-  elif start_port_forward "prometheus-k8s" "9091"; then
-    PROM_MODE="pf"
-  else
-    cat >&2 <<'EOF'
-ERROR: Could not access monitoring via service proxy OR via port-forward.
-
-Proxy tests:
-  oc -n openshift-monitoring get --raw \
-    /api/v1/namespaces/openshift-monitoring/services/thanos-querier:9091/proxy/api/v1/status/runtimeinfo
-  oc -n openshift-monitoring get --raw \
-    /api/v1/namespaces/openshift-monitoring/services/prometheus-k8s:9091/proxy/api/v1/status/runtimeinfo
-
-Port-forward test:
-  oc -n openshift-monitoring port-forward svc/thanos-querier 19091:9091
-  curl -s http://127.0.0.1:19091/api/v1/status/runtimeinfo | head
-EOF
-    exit 1
-  fi
-fi
-
 prom_query() {
   local q="$1"
   local enc; enc="$(uri_encode "$q")"
@@ -166,6 +152,37 @@ prom_query() {
     curl -fsS "http://127.0.0.1:${PF_LOCAL_PORT}/api/v1/query?query=${enc}"
   fi
 }
+
+# -------------------------
+# Choose monitoring mode
+# -------------------------
+if [[ "$TRY_SERVICE_PROXY" == "1" ]]; then
+  for base in "${PROXY_BASES[@]}"; do
+    if proxy_works "$base"; then
+      PROM_MODE="proxy"
+      PROXY_BASE="$base"
+      break
+    fi
+  done
+fi
+
+if [[ -z "${PROM_MODE:-}" ]]; then
+  # Prefer thanos querier
+  if start_port_forward "thanos-querier" "9091"; then
+    PROM_MODE="pf"
+  elif start_port_forward "prometheus-k8s" "9091"; then
+    PROM_MODE="pf"
+  else
+    cat >&2 <<'EOF'
+ERROR: Could not query monitoring.
+
+You can manually test:
+  oc -n openshift-monitoring port-forward svc/thanos-querier 19091:9091
+  curl -s "http://127.0.0.1:19091/api/v1/query?query=up" | head
+EOF
+    exit 1
+  fi
+fi
 
 # -------------------------
 # Cluster inventory
@@ -210,20 +227,26 @@ Q_CPU="sum by (namespace, name) (rate(kubevirt_vmi_cpu_usage_seconds_total[${WIN
 Q_IOWAIT="sum by (namespace, name) (rate(kubevirt_vmi_vcpu_wait_seconds_total[${WINDOW}]))"
 Q_DELAY="sum by (namespace, name) (irate(kubevirt_vmi_vcpu_delay_seconds_total[${WINDOW}]))"
 
-CPU_JSON="$(prom_query "$Q_CPU")"
-IOWAIT_JSON="$(prom_query "$Q_IOWAIT" 2>/dev/null || echo '{"status":"success","data":{"result":[]}}')"
-DELAY_JSON="$(prom_query "$Q_DELAY" 2>/dev/null || echo '{"status":"success","data":{"result":[]}}')"
+CPU_JSON="$(prom_query "$Q_CPU" || true)"
 
+# Make metric absence obvious (common on clusters where KubeVirt monitoring isn't scraped)
 if ! jq -e '.status=="success"' >/dev/null 2>&1 <<<"$CPU_JSON"; then
-  echo "ERROR: CPU monitoring query failed. Raw response:" >&2
+  echo "ERROR: Monitoring query did not return a successful JSON payload for CPU metric." >&2
+  echo "Raw response:" >&2
   echo "$CPU_JSON" >&2
   exit 1
 fi
 
+# Optional context metrics; keep empty if missing
+IOWAIT_JSON="$(prom_query "$Q_IOWAIT" 2>/dev/null || echo '{"status":"success","data":{"result":[]}}')"
+DELAY_JSON="$(prom_query "$Q_DELAY" 2>/dev/null || echo '{"status":"success","data":{"result":[]}}')"
+
+# Convert Prom results to maps keyed by "namespace/name"
 to_map='
   .data.result
   | reduce .[] as $r ({}; . + { (($r.metric.namespace + "/" + $r.metric.name)): ($r.value[1]|tonumber) })
 '
+
 CPU_MAP="$(jq -c "$to_map" <<<"$CPU_JSON")"
 IOWAIT_MAP="$(jq -c "$to_map" <<<"$IOWAIT_JSON" 2>/dev/null || echo '{}')"
 DELAY_MAP="$(jq -c "$to_map" <<<"$DELAY_JSON" 2>/dev/null || echo '{}')"
