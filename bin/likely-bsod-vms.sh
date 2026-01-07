@@ -2,9 +2,9 @@
 set -euo pipefail
 
 WINDOW="${WINDOW:-10m}"
-TOP_N="${TOP_N:-200}"          # larger candidate pool for wedge mode
+TOP_N="${TOP_N:-20}"
 MODE="${MODE:-top}"            # top | wedge
-THRESH_PCT="${THRESH_PCT:-90}" # CPU% threshold for wedge
+THRESH_PCT="${THRESH_PCT:-90}" # for MODE=wedge
 NET_MAX_BPS="${NET_MAX_BPS:-50000}"
 DISK_MAX_BPS="${DISK_MAX_BPS:-50000}"
 DEBUG=0
@@ -14,13 +14,8 @@ INSPECT_VMI=""
 usage() {
   cat <<EOF
 Usage:
-  # show top N by CPU cores
   $0 --top 20 --window 10m [--debug]
-
-  # wedge detection (recommended: bigger candidate pool)
   MODE=wedge TOP_N=200 THRESH_PCT=90 NET_MAX_BPS=50000 DISK_MAX_BPS=50000 $0 --window 10m
-
-  # inspect a specific VMI's raw label series
   $0 --inspect <namespace> <vmi> [--window 10m]
 EOF
 }
@@ -59,7 +54,6 @@ VMI_RES="$(detect_vmi_resource || true)"
 PF_PID=""
 PF_PORT=""
 PF_SVC=""
-
 cleanup() { [[ -n "${PF_PID:-}" ]] && kill "${PF_PID}" >/dev/null 2>&1 || true; }
 trap cleanup EXIT
 
@@ -77,7 +71,7 @@ pick_free_port() {
 mon_post() {
   local q="$1"
   curl --ipv4 --http1.1 -ksS \
-    --connect-timeout 2 --max-time 25 \
+    --connect-timeout 2 --max-time 30 \
     -H "Authorization: Bearer ${TOKEN}" \
     "https://127.0.0.1:${PF_PORT}/api/v1/query" \
     --data-urlencode "query=${q}"
@@ -158,7 +152,7 @@ if [[ -n "${INSPECT_NS:-}" && -n "${INSPECT_VMI:-}" ]]; then
   exit 0
 fi
 
-# ---- Candidate selection: topk by CPU cores ----
+# ---- Candidates: topk by CPU cores ----
 CPU_EXPR="sum by (namespace, name) (rate(kubevirt_vmi_cpu_usage_seconds_total[${WINDOW}]))"
 TOP_CPU_Q="topk(${TOP_N}, ${CPU_EXPR})"
 TOP_CPU_JSON="$(mon_post "$TOP_CPU_Q")"
@@ -171,22 +165,12 @@ jq -e '.status=="success"' >/dev/null 2>&1 <<<"$TOP_CPU_JSON" || {
 TOP_LIST_TSV="$(jq -r '.data.result[] | [.metric.namespace, .metric.name, (.value[1]|tonumber)] | @tsv' <<<"$TOP_CPU_JSON")"
 [[ -n "$TOP_LIST_TSV" ]] || { echo "No results from topk query."; exit 0; }
 
-# Map key -> cpuCores
 WANTED_KEYS_JSON="$(jq -Rn --arg s "$TOP_LIST_TSV" '
   ($s | split("\n") | map(select(length>0))) as $lines
   | reduce $lines[] as $l ({}; ($l|split("\t")) as $p | . + { ($p[0]+"/"+$p[1]): ($p[2]|tonumber) })
 ')"
 
-# Build regex filters for candidate-only metric queries (separate name and namespace regex)
-NAME_RE="$(printf "%s\n" "$TOP_LIST_TSV" | awk -F'\t' '{print $2}' | sed 's/[.[\*^$()+?{|\\]/\\&/g' | paste -sd'|' -)"
-NS_RE="$(printf "%s\n" "$TOP_LIST_TSV" | awk -F'\t' '{print $1}' | sort -u | sed 's/[.[\*^$()+?{|\\]/\\&/g' | paste -sd'|' -)"
-
-[[ "$DEBUG" -eq 1 ]] && {
-  echo "DEBUG: candidate namespaces regex size: $(tr -cd '|' <<<"$NS_RE" | wc -c | awk '{print $1+1}')" >&2
-  echo "DEBUG: candidate names regex size: $(tr -cd '|' <<<"$NAME_RE" | wc -c | awk '{print $1+1}')" >&2
-}
-
-# Candidate-only maps for wedge mode
+# ---- Wedge maps: query cluster-wide aggregated series (no regex) ----
 RX_MAP="{}"; TX_MAP="{}"; RD_MAP="{}"; WR_MAP="{}"
 if [[ "$MODE" == "wedge" ]]; then
   to_map='
@@ -194,30 +178,28 @@ if [[ "$MODE" == "wedge" ]]; then
     | reduce .[] as $r ({}; . + { (($r.metric.namespace + "/" + $r.metric.name)): ($r.value[1]|tonumber) })
   '
 
-  # Restrict by candidate namespace+name using =~ regex selectors
-  RX_Q="sum by (namespace, name) (rate(kubevirt_vmi_network_receive_bytes_total{namespace=~\"${NS_RE}\",name=~\"${NAME_RE}\"}[${WINDOW}]))"
-  TX_Q="sum by (namespace, name) (rate(kubevirt_vmi_network_transmit_bytes_total{namespace=~\"${NS_RE}\",name=~\"${NAME_RE}\"}[${WINDOW}]))"
-  RD_Q="sum by (namespace, name) (rate(kubevirt_vmi_storage_read_traffic_bytes_total{namespace=~\"${NS_RE}\",name=~\"${NAME_RE}\"}[${WINDOW}]))"
-  WR_Q="sum by (namespace, name) (rate(kubevirt_vmi_storage_write_traffic_bytes_total{namespace=~\"${NS_RE}\",name=~\"${NAME_RE}\"}[${WINDOW}]))"
+  RX_JSON="$(mon_post "sum by (namespace, name) (rate(kubevirt_vmi_network_receive_bytes_total[${WINDOW}]))" 2>/dev/null || echo '{"status":"success","data":{"result":[]}}')"
+  TX_JSON="$(mon_post "sum by (namespace, name) (rate(kubevirt_vmi_network_transmit_bytes_total[${WINDOW}]))" 2>/dev/null || echo '{"status":"success","data":{"result":[]}}')"
+  RD_JSON="$(mon_post "sum by (namespace, name) (rate(kubevirt_vmi_storage_read_traffic_bytes_total[${WINDOW}]))" 2>/dev/null || echo '{"status":"success","data":{"result":[]}}')"
+  WR_JSON="$(mon_post "sum by (namespace, name) (rate(kubevirt_vmi_storage_write_traffic_bytes_total[${WINDOW}]))" 2>/dev/null || echo '{"status":"success","data":{"result":[]}}')"
 
-  RX_MAP="$(mon_post "$RX_Q" | jq -c "$to_map" 2>/dev/null || echo '{}')"
-  TX_MAP="$(mon_post "$TX_Q" | jq -c "$to_map" 2>/dev/null || echo '{}')"
-  RD_MAP="$(mon_post "$RD_Q" | jq -c "$to_map" 2>/dev/null || echo '{}')"
-  WR_MAP="$(mon_post "$WR_Q" | jq -c "$to_map" 2>/dev/null || echo '{}')"
+  RX_MAP="$(jq -c "$to_map" <<<"$RX_JSON" 2>/dev/null || echo '{}')"
+  TX_MAP="$(jq -c "$to_map" <<<"$TX_JSON" 2>/dev/null || echo '{}')"
+  RD_MAP="$(jq -c "$to_map" <<<"$RD_JSON" 2>/dev/null || echo '{}')"
+  WR_MAP="$(jq -c "$to_map" <<<"$WR_JSON" 2>/dev/null || echo '{}')"
 
   [[ "$DEBUG" -eq 1 ]] && {
-    echo "DEBUG: rx series: $(jq 'length' <<<"$RX_MAP")" >&2
-    echo "DEBUG: tx series: $(jq 'length' <<<"$TX_MAP")" >&2
-    echo "DEBUG: rd series: $(jq 'length' <<<"$RD_MAP")" >&2
-    echo "DEBUG: wr series: $(jq 'length' <<<"$WR_MAP")" >&2
+    echo "DEBUG: rx entries: $(jq 'length' <<<"$RX_MAP")" >&2
+    echo "DEBUG: tx entries: $(jq 'length' <<<"$TX_MAP")" >&2
+    echo "DEBUG: rd entries: $(jq 'length' <<<"$RD_MAP")" >&2
+    echo "DEBUG: wr entries: $(jq 'length' <<<"$WR_MAP")" >&2
   }
 fi
 
-# Pull VMIs once and filter to candidates
 VMI_JSON="$(oc get "${VMI_RES}" -A -o json)"
 
 echo "Monitoring: svc/${PF_SVC} via https://127.0.0.1:${PF_PORT}"
-echo "Mode=${MODE} Window=${WINDOW} TopCandidates=${TOP_N}"
+echo "Mode=${MODE} Window=${WINDOW} Top=${TOP_N}"
 if [[ "$MODE" == "wedge" ]]; then
   echo "Wedge filters: CPU>=${THRESH_PCT}% net<=${NET_MAX_BPS}B/s disk<=${DISK_MAX_BPS}B/s"
 fi
