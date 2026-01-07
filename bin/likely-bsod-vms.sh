@@ -2,30 +2,42 @@
 set -euo pipefail
 
 # likely-bsod-vms.sh
-# Heuristic: VMIs with sustained high CPU usage (>= THRESH_PCT% of vCPU) over WINDOW.
-# Cluster-wide; includes NODE so you can group by worker node.
+# Heuristic: list VMIs likely "wedged" by sustained high CPU usage.
 #
-# Monitoring access: port-forward to openshift-monitoring svc/thanos-querier:9091 (fallback prometheus-k8s:9091)
-# Query endpoint is HTTPS and typically requires a Bearer token.
+# This version:
+# - Avoids passing huge JSON blobs to jq via command-line args (prevents "Argument list too long")
+# - Uses an EXISTING port-forward to monitoring (default 19091 -> thanos-querier:9091)
+# - Uses HTTPS + Bearer token + curl --http1.1 (avoids HTTP/2 PROTOCOL_ERROR)
 #
-# Requires: oc, jq, curl
+# Requirements: oc, jq, curl
+#
+# Usage:
+#   # Terminal 1:
+#   oc -n openshift-monitoring port-forward svc/thanos-querier 19091:9091
+#
+#   # Terminal 2:
+#   WINDOW=10m THRESH_PCT=90 ./likely-bsod-vms.sh
+#   ./likely-bsod-vms.sh --port 19091 --window 5m --threshold 95 --debug
 
 WINDOW="${WINDOW:-10m}"
 THRESH_PCT="${THRESH_PCT:-90}"
+MON_PORT="${MON_PORT:-19091}"
 DEBUG=0
 
 usage() {
   cat <<EOF
-Usage: $0 [--window 10m] [--threshold 90] [--debug]
+Usage: $0 [--port 19091] [--window 10m] [--threshold 90] [--debug]
 
 Env:
   WINDOW=10m
   THRESH_PCT=90
+  MON_PORT=19091
 EOF
 }
 
 while [[ $# -gt 0 ]]; do
   case "$1" in
+    --port) MON_PORT="$2"; shift 2;;
     --window) WINDOW="$2"; shift 2;;
     --threshold) THRESH_PCT="$2"; shift 2;;
     --debug) DEBUG=1; shift 1;;
@@ -40,19 +52,17 @@ need jq
 need curl
 
 if ! oc whoami >/dev/null 2>&1; then
-  echo "ERROR: Not logged in. Run: oc login --web" >&2
+  echo "ERROR: oc is not logged in (oc whoami failed). Run: oc login --web" >&2
   exit 1
 fi
 
 TOKEN="$(oc whoami -t 2>/dev/null || true)"
 if [[ -z "${TOKEN:-}" ]]; then
-  echo "ERROR: Could not get token (oc whoami -t). Are you logged in with a token-capable auth?" >&2
+  echo "ERROR: Could not obtain token via 'oc whoami -t'." >&2
   exit 1
 fi
 
-# -------------------------
-# Detect VMI resource
-# -------------------------
+# Detect VMI resource name (your cluster supports vmi/virtualmachineinstances)
 detect_vmi_resource() {
   local candidates=("virtualmachineinstances" "vmi" "virtualmachineinstance")
   local r
@@ -67,241 +77,162 @@ detect_vmi_resource() {
 
 VMI_RES="$(detect_vmi_resource || true)"
 if [[ -z "${VMI_RES:-}" ]]; then
-  cat >&2 <<'EOF'
-ERROR: No VirtualMachineInstance API resource found.
-Run:
-  oc api-resources | egrep -i 'virtualmachineinstances|vmi|kubevirt'
-EOF
+  echo "ERROR: Could not find VirtualMachineInstance API resource." >&2
+  echo "Try: oc api-resources | egrep -i 'virtualmachineinstances|vmi|kubevirt'" >&2
   exit 1
 fi
 
-# -------------------------
-# Port-forward helpers
-# -------------------------
-PF_PID=""
-PF_LOCAL_PORT=""
+# Helpers
+uri_encode() { jq -rn --arg v "$1" '$v|@uri'; }
 
-cleanup_pf() {
-  [[ -n "${PF_PID:-}" ]] && kill "${PF_PID}" >/dev/null 2>&1 || true
-}
-trap cleanup_pf EXIT
-
-pick_free_port() {
-  local p i
-  for i in {1..50}; do
-    p=$(( (RANDOM % 15000) + 20000 ))
-    # If nothing is listening, curl will fail quickly; treat as "free enough"
-    if ! curl -ksS "https://127.0.0.1:${p}/" >/dev/null 2>&1; then
-      echo "$p"
-      return 0
-    fi
-  done
-  echo 29091
-}
-
-# Query over HTTPS with bearer token (OCP monitoring commonly requires this)
-mon_get() {
-  local path="$1"
-  curl -ksS -H "Authorization: Bearer ${TOKEN}" "https://127.0.0.1:${PF_LOCAL_PORT}${path}"
-}
-
-start_port_forward() {
-  local svc="$1" rport="$2"
-
-  PF_LOCAL_PORT="$(pick_free_port)"
-
-  [[ "$DEBUG" -eq 1 ]] && echo "DEBUG: port-forward svc/${svc} ${PF_LOCAL_PORT}:${rport}" >&2
-
-  # Start port-forward in background
-  oc -n openshift-monitoring port-forward "svc/${svc}" "${PF_LOCAL_PORT}:${rport}" >/dev/null 2>&1 &
-  PF_PID="$!"
-
-  # Wait until it responds to a simple Prom query
-  local i out
-  for i in {1..60}; do
-    out="$(mon_get "/api/v1/query?query=up" 2>/dev/null || true)"
-    if jq -e '.status=="success"' >/dev/null 2>&1 <<<"$out"; then
-      return 0
-    fi
-    sleep 0.25
-  done
-
-  # Failed: stop and clear
-  kill "${PF_PID}" >/dev/null 2>&1 || true
-  PF_PID=""
-  PF_LOCAL_PORT=""
-  return 1
-}
-
-# Prefer thanos, fall back to prometheus
-MON_SVC=""
-if start_port_forward "thanos-querier" "9091"; then
-  MON_SVC="thanos-querier"
-elif start_port_forward "prometheus-k8s" "9091"; then
-  MON_SVC="prometheus-k8s"
-else
-  cat >&2 <<'EOF'
-ERROR: Could not query monitoring via port-forward.
-
-Manual test (keep port-forward running in one terminal, curl in another):
-  oc -n openshift-monitoring port-forward svc/thanos-querier 19091:9091
-  TOKEN="$(oc whoami -t)"
-  curl -ksS -H "Authorization: Bearer $TOKEN" \
-    "https://127.0.0.1:19091/api/v1/query?query=up" | head
-EOF
-  exit 1
-fi
-
-prom_query() {
+mon_query() {
   local q="$1"
-  local enc
-  enc="$(jq -rn --arg v "$q" '$v|@uri')"
-  mon_get "/api/v1/query?query=${enc}"
+  local enc; enc="$(uri_encode "$q")"
+  curl --http1.1 -ksS \
+    -H "Authorization: Bearer ${TOKEN}" \
+    "https://127.0.0.1:${MON_PORT}/api/v1/query?query=${enc}"
 }
 
-# -------------------------
-# Inventory: workers + VMIs
-# -------------------------
-WORKERS_JSON="$(oc get nodes -l node-role.kubernetes.io/worker -o json)"
-WORKERS_LIST="$(jq -r '.items[].metadata.name' <<<"$WORKERS_JSON" | sort)"
-if [[ -z "${WORKERS_LIST}" ]]; then
-  echo "WARN: No worker nodes found via label; using all schedulable nodes." >&2
-  WORKERS_LIST="$(oc get nodes -o json | jq -r '.items[] | select((.spec.unschedulable // false)==false) | .metadata.name' | sort)"
+# Validate monitoring endpoint (requires your port-forward running in another terminal)
+if [[ "$DEBUG" -eq 1 ]]; then
+  echo "DEBUG: testing monitoring endpoint on https://127.0.0.1:${MON_PORT} ..." >&2
 fi
-WORKERS_SET_JSON="$(jq -Rn --arg s "$WORKERS_LIST" '
-  ($s | split("\n") | map(select(length>0))) as $a
-  | reduce $a[] as $n ({}; . + {($n): true})
-')"
 
-VMI_JSON="$(oc get "${VMI_RES}" -A -o json)"
+UP_JSON="$(mon_query "up" 2>/dev/null || true)"
+if ! jq -e '.status=="success"' >/dev/null 2>&1 <<<"$UP_JSON"; then
+  cat >&2 <<EOF
+ERROR: Could not query monitoring at https://127.0.0.1:${MON_PORT}
 
-LOOKUP_JSON="$(jq -c '
-  def vcpu_count:
-    ((.spec.domain.cpu.cores   // 1)
-    *(.spec.domain.cpu.sockets // 1)
-    *(.spec.domain.cpu.threads // 1));
+Make sure port-forward is running in another terminal:
+  oc -n openshift-monitoring port-forward svc/thanos-querier ${MON_PORT}:9091
 
-  reduce .items[] as $i ({}; . + {
-    (($i.metadata.namespace + "/" + $i.metadata.name)):
-    {
-      vcpus: ( ($i | vcpu_count) | tonumber ),
-      phase: ($i.status.phase // ""),
-      node: ($i.status.nodeName // ""),
-      vmOwner: (
-        ($i.metadata.ownerReferences // [])
-        | map(select(.kind=="VirtualMachine"))[0].name // ""
-      )
-    }
-  })
-' <<<"$VMI_JSON")"
+Manual test:
+  TOKEN="\$(oc whoami -t)"
+  curl --http1.1 -ksS -H "Authorization: Bearer \$TOKEN" \\
+    "https://127.0.0.1:${MON_PORT}/api/v1/query?query=up" | head
+EOF
+  exit 1
+fi
 
-# -------------------------
-# Metrics (CPU heuristic)
-# -------------------------
+# Temp files (avoid argv limits)
+TMPDIR="$(mktemp -d)"
+trap 'rm -rf "$TMPDIR"' EXIT
+
+VMIS_JSON_FILE="${TMPDIR}/vmis.json"
+CPU_JSON_FILE="${TMPDIR}/cpu.json"
+IOWAIT_JSON_FILE="${TMPDIR}/iowait.json"
+DELAY_JSON_FILE="${TMPDIR}/delay.json"
+WORKERS_JSON_FILE="${TMPDIR}/workers.json"
+
+# Worker nodes set (for filtering)
+oc get nodes -l node-role.kubernetes.io/worker -o json > "$WORKERS_JSON_FILE" 2>/dev/null || true
+
+# VMIs cluster-wide
+oc get "${VMI_RES}" -A -o json > "$VMIS_JSON_FILE"
+
+# PromQL queries
 Q_CPU="sum by (namespace, name) (rate(kubevirt_vmi_cpu_usage_seconds_total[${WINDOW}]))"
 Q_IOWAIT="sum by (namespace, name) (rate(kubevirt_vmi_vcpu_wait_seconds_total[${WINDOW}]))"
 Q_DELAY="sum by (namespace, name) (irate(kubevirt_vmi_vcpu_delay_seconds_total[${WINDOW}]))"
 
-CPU_JSON="$(prom_query "$Q_CPU" || true)"
-if ! jq -e '.status=="success"' >/dev/null 2>&1 <<<"$CPU_JSON"; then
+mon_query "$Q_CPU" > "$CPU_JSON_FILE"
+mon_query "$Q_IOWAIT" > "$IOWAIT_JSON_FILE" 2>/dev/null || echo '{"status":"success","data":{"result":[]}}' > "$IOWAIT_JSON_FILE"
+mon_query "$Q_DELAY" > "$DELAY_JSON_FILE" 2>/dev/null || echo '{"status":"success","data":{"result":[]}}' > "$DELAY_JSON_FILE"
+
+if ! jq -e '.status=="success"' >/dev/null 2>&1 "$CPU_JSON_FILE"; then
   echo "ERROR: CPU query did not return success. Raw response:" >&2
-  echo "$CPU_JSON" >&2
+  cat "$CPU_JSON_FILE" >&2
   exit 1
 fi
 
-IOWAIT_JSON="$(prom_query "$Q_IOWAIT" 2>/dev/null || echo '{"status":"success","data":{"result":[]}}')"
-DELAY_JSON="$(prom_query "$Q_DELAY" 2>/dev/null || echo '{"status":"success","data":{"result":[]}}')"
-
-# If CPU metric exists but returns 0 series, tell you plainly (then we can switch metrics)
-CPU_SERIES_COUNT="$(jq '.data.result|length' <<<"$CPU_JSON")"
-if [[ "$CPU_SERIES_COUNT" -eq 0 ]]; then
-  echo "NOTE: CPU metric query returned 0 series." >&2
-  echo "      Either no VMIs are being scraped, or metric name differs in your cluster." >&2
-  echo "      Quick discovery (prints matching metric names):" >&2
-  echo "      curl -ksS -H \"Authorization: Bearer \$(oc whoami -t)\" \\" >&2
-  echo "        \"https://127.0.0.1:${PF_LOCAL_PORT}/api/v1/label/__name__/values\" \\" >&2
-  echo "        | jq -r '.data[]' | egrep -i 'kubevirt.*vmi.*cpu|virt.*cpu' | head -n 50" >&2
+CPU_SERIES="$(jq '.data.result|length' "$CPU_JSON_FILE")"
+if [[ "$DEBUG" -eq 1 ]]; then
+  echo "DEBUG: VMI resource: ${VMI_RES}" >&2
+  echo "DEBUG: cpu series returned: ${CPU_SERIES}" >&2
 fi
 
-to_map='
-  .data.result
-  | reduce .[] as $r ({}; . + { (($r.metric.namespace + "/" + $r.metric.name)): ($r.value[1]|tonumber) })
-'
-CPU_MAP="$(jq -c "$to_map" <<<"$CPU_JSON")"
-IOWAIT_MAP="$(jq -c "$to_map" <<<"$IOWAIT_JSON" 2>/dev/null || echo '{}')"
-DELAY_MAP="$(jq -c "$to_map" <<<"$DELAY_JSON" 2>/dev/null || echo '{}')"
+if [[ "$CPU_SERIES" -eq 0 ]]; then
+  cat >&2 <<EOF
+NOTE: CPU metric query returned 0 series.
+This usually means kubevirt metrics are not being scraped under that metric name.
 
-RESULTS_JSON="$(jq -c --argjson lookup "$LOOKUP_JSON" \
-                      --argjson cpuMap "$CPU_MAP" \
-                      --argjson ioMap "$IOWAIT_MAP" \
-                      --argjson dlyMap "$DELAY_MAP" \
-                      --argjson workers "$WORKERS_SET_JSON" \
-                      --arg thresh "$THRESH_PCT" '
+To discover available metric names (while port-forward is running):
+  TOKEN="\$(oc whoami -t)"
+  curl --http1.1 -ksS -H "Authorization: Bearer \$TOKEN" \\
+    "https://127.0.0.1:${MON_PORT}/api/v1/label/__name__/values" \\
+    | jq -r '.data[]' | egrep -i 'kubevirt.*vmi.*cpu|virt.*cpu' | head -n 50
+EOF
+  # Still continue; script will likely output "no matches"
+fi
+
+# Produce results as TSV (NODE first column)
+jq -r --slurpfile vmis "$VMIS_JSON_FILE" \
+      --slurpfile cpu "$CPU_JSON_FILE" \
+      --slurpfile iow "$IOWAIT_JSON_FILE" \
+      --slurpfile dly "$DELAY_JSON_FILE" \
+      --slurpfile workers "$WORKERS_JSON_FILE" \
+      --arg thresh "$THRESH_PCT" '
+  def vcpu_count(v):
+    ((v.spec.domain.cpu.cores // 1) *
+     (v.spec.domain.cpu.sockets // 1) *
+     (v.spec.domain.cpu.threads // 1));
+
+  def to_map(res):
+    res.data.result
+    | reduce .[] as $r ({}; . + { (($r.metric.namespace + "/" + $r.metric.name)): ($r.value[1]|tonumber) });
+
   def pct(a;b): if b <= 0 then 0 else (a / b * 100) end;
 
-  $cpuMap
-  | to_entries
-  | map(. as $e
-    | $e.key as $k
-    | ($lookup[$k] // {vcpus:1, phase:"", node:"", vmOwner:""}) as $li
-    | ($li.vcpus|tonumber) as $vcpus
-    | ($e.value|tonumber) as $cpuCores
-    | (pct($cpuCores; $vcpus)) as $cpuPct
-    | {
-        ns: ($k|split("/")[0]),
-        vmi: ($k|split("/")[1]),
-        vmOwner: ($li.vmOwner // ""),
-        phase: ($li.phase // ""),
-        node: ($li.node // ""),
-        vcpus: $vcpus,
-        cpuCores: $cpuCores,
-        cpuPct: $cpuPct,
-        ioWait: ($ioMap[$k] // 0),
-        delay: ($dlyMap[$k] // 0)
-      }
-  )
-  | map(select(.phase == "" or .phase == "Running"))
-  | map(select(.node != "" and ($workers[.node] // false)))
-  | map(select(.cpuPct >= ($thresh|tonumber)))
-  | sort_by(.node, -.cpuPct, .ns, .vmi)
-')"
+  # workers set (if worker label missing, include all nodes by making empty set and accepting all)
+  ($workers[0].items // []) as $witems
+  | (reduce $witems[] as $n ({}; . + {($n.metadata.name): true})) as $wset
 
-# -------------------------
-# Output
-# -------------------------
-echo "Monitoring mode: port-forward svc/${MON_SVC} (https://127.0.0.1:${PF_LOCAL_PORT})"
-echo "VMI resource: ${VMI_RES}"
-echo "Window: ${WINDOW} | Threshold: >= ${THRESH_PCT}% of vCPU"
-echo
+  # vmi lookup map keyed by ns/name
+  | ($vmis[0].items
+     | reduce .[] as $v ({}; . + {
+         (($v.metadata.namespace + "/" + $v.metadata.name)):
+         {
+           vcpus: (vcpu_count($v)|tonumber),
+           phase: ($v.status.phase // ""),
+           node: ($v.status.nodeName // ""),
+           vmOwner: ((($v.metadata.ownerReferences // []) | map(select(.kind=="VirtualMachine"))[0].name) // "")
+         }
+       })
+    ) as $vmap
 
-if [[ "$DEBUG" -eq 1 ]]; then
-  echo "DEBUG: worker nodes: $(wc -l <<<"$WORKERS_LIST" | awk '{print $1}')"
-  echo "DEBUG: vmis total: $(jq '.items|length' <<<"$VMI_JSON")"
-  echo "DEBUG: cpu series returned: $(jq '.data.result|length' <<<"$CPU_JSON")"
-  echo
-fi
+  | (to_map($cpu[0])) as $cpuMap
+  | (to_map($iow[0])) as $iowMap
+  | (to_map($dly[0])) as $dlyMap
 
-if [[ "$(jq 'length' <<<"$RESULTS_JSON")" -eq 0 ]]; then
-  echo "No VMIs matched the heuristic (high sustained CPU on worker nodes)."
-  exit 0
-fi
-
-OUT_TSV="$(
-  jq -r '
-    ["NODE","NAMESPACE","VMI","VM(owner)","vCPU","CPU(cores)","CPU(%)","IOwait","Delay"] | @tsv,
-    (.[] | [
-      .node, .ns, .vmi, (.vmOwner // ""),
-      (.vcpus|tostring),
-      (.cpuCores|tostring),
-      (.cpuPct|tostring),
-      (.ioWait|tostring),
-      (.delay|tostring)
-    ] | @tsv)
-  ' <<<"$RESULTS_JSON"
-)"
-
-if command -v column >/dev/null 2>&1; then
-  printf "%s\n" "$OUT_TSV" | column -t -s $'\t'
-else
-  printf "%s\n" "$OUT_TSV"
-fi
+  | ["NODE","NAMESPACE","VMI","VM(owner)","vCPU","CPU(cores)","CPU(%)","IOwait","Delay"] | @tsv,
+    ($cpuMap | to_entries[]
+      | .key as $k
+      | ($vmap[$k] // null) as $v
+      | select($v != null)
+      | select(($v.phase == "" or $v.phase == "Running"))
+      | select($v.node != "")
+      # If worker set is empty, accept all; otherwise require membership
+      | select((($wset|length)==0) or ($wset[$v.node] == true))
+      | .value as $cpuCores
+      | ($v.vcpus|tonumber) as $vcpus
+      | (pct($cpuCores; $vcpus)) as $cpuPct
+      | select($cpuPct >= ($thresh|tonumber))
+      | [
+          $v.node,
+          ($k|split("/")[0]),
+          ($k|split("/")[1]),
+          ($v.vmOwner // ""),
+          ($vcpus|tostring),
+          ($cpuCores|tostring),
+          ($cpuPct|tostring),
+          (($iowMap[$k] // 0)|tostring),
+          (($dlyMap[$k] // 0)|tostring)
+        ] | @tsv
+    )
+' | {
+  if command -v column >/dev/null 2>&1; then
+    column -t -s $'\t'
+  else
+    cat
+  fi
+}
