@@ -3,27 +3,18 @@ set -euo pipefail
 
 WINDOW="${WINDOW:-10m}"
 TOP_N="${TOP_N:-20}"
-DEBUG=0
-
-# Optional wedge filters (only applied if you use --mode wedge)
+MODE="${MODE:-top}"   # top | wedge
 THRESH_PCT="${THRESH_PCT:-85}"
 NET_MAX_BPS="${NET_MAX_BPS:-50000}"
 DISK_MAX_BPS="${DISK_MAX_BPS:-50000}"
-MODE="${MODE:-top}"   # top | wedge
+DEBUG=0
 
 usage() {
   cat <<EOF
 Usage:
-  # show top N VMIs by CPU% (fast)
-  $0 [--window 10m] [--top 20] [--debug]
+  $0 --top 20 --window 10m [--debug]
+  MODE=wedge THRESH_PCT=85 NET_MAX_BPS=50000 DISK_MAX_BPS=50000 $0 --top 200 --window 10m
 
-  # show "wedge-like" VMIs (CPU high + net/disk low)
-  MODE=wedge THRESH_PCT=85 NET_MAX_BPS=50000 DISK_MAX_BPS=50000 $0 --window 10m --top 200
-
-Env:
-  WINDOW=10m
-  TOP_N=20
-  MODE=top|wedge
 EOF
 }
 
@@ -44,7 +35,6 @@ oc whoami >/dev/null 2>&1 || { echo "ERROR: oc not logged in. Run: oc login --we
 TOKEN="$(oc whoami -t 2>/dev/null || true)"
 [[ -n "${TOKEN:-}" ]] || { echo "ERROR: oc whoami -t returned empty token" >&2; exit 1; }
 
-# Detect VMI resource
 detect_vmi_resource() {
   local candidates=("virtualmachineinstances" "vmi" "virtualmachineinstance")
   local r
@@ -58,7 +48,6 @@ detect_vmi_resource() {
 VMI_RES="$(detect_vmi_resource || true)"
 [[ -n "${VMI_RES:-}" ]] || { echo "ERROR: No VMI API resource found" >&2; exit 1; }
 
-# ---- port-forward (auto) ----
 PF_PID=""
 PF_PORT=""
 PF_SVC=""
@@ -68,9 +57,10 @@ trap cleanup EXIT
 
 pick_free_port() {
   local p i
-  for i in {1..80}; do
+  for i in {1..120}; do
     p=$(( (RANDOM % 15000) + 20000 ))
-    if ! curl --http1.1 -ksS "https://127.0.0.1:${p}/" >/dev/null 2>&1; then
+    # if nothing is listening, this will fail -> treat as "free enough"
+    if ! curl --ipv4 --http1.1 -ksS "https://127.0.0.1:${p}/" >/dev/null 2>&1; then
       echo "$p"; return 0
     fi
   done
@@ -79,82 +69,117 @@ pick_free_port() {
 
 mon_post() {
   local q="$1"
-  curl --http1.1 -ksS \
-    --connect-timeout 3 --max-time 20 \
+  curl --ipv4 --http1.1 -ksS \
+    --connect-timeout 2 --max-time 20 \
     -H "Authorization: Bearer ${TOKEN}" \
     "https://127.0.0.1:${PF_PORT}/api/v1/query" \
     --data-urlencode "query=${q}"
+}
+
+wait_listening() {
+  # Wait until the port-forward binds (connection refused stops)
+  local i
+  for i in {1..120}; do
+    # We don't care about TLS/HTTP correctness here—only whether the socket is accepting connections.
+    if curl --ipv4 --http1.1 -k -sS "https://127.0.0.1:${PF_PORT}/" >/dev/null 2>&1; then
+      return 0
+    fi
+    # If it's still refusing, keep waiting
+    sleep 0.1
+  done
+  return 1
 }
 
 start_pf() {
   local svc="$1"
   PF_PORT="$(pick_free_port)"
   [[ "$DEBUG" -eq 1 ]] && echo "DEBUG: starting port-forward svc/${svc} ${PF_PORT}:9091" >&2
+
   oc -n openshift-monitoring port-forward --address 127.0.0.1 "svc/${svc}" "${PF_PORT}:9091" >/dev/null 2>&1 &
   PF_PID="$!"
   PF_SVC="$svc"
 
+  # Ensure the local port is actually bound
+  if ! wait_listening; then
+    [[ "$DEBUG" -eq 1 ]] && echo "DEBUG: port ${PF_PORT} never started listening for svc/${svc}" >&2
+    kill "${PF_PID}" >/dev/null 2>&1 || true
+    PF_PID=""; PF_PORT=""; PF_SVC=""
+    return 1
+  fi
+
+  # Now verify Prometheus API works (POST up)
   local i out
-  for i in {1..60}; do
+  for i in {1..80}; do
     out="$(mon_post "up" 2>/dev/null || true)"
     if jq -e '.status=="success"' >/dev/null 2>&1 <<<"$out"; then
       return 0
     fi
-    sleep 0.25
+    sleep 0.2
   done
 
+  [[ "$DEBUG" -eq 1 ]] && echo "DEBUG: port-forward listening but Prom query didn't succeed for svc/${svc}" >&2
   kill "${PF_PID}" >/dev/null 2>&1 || true
   PF_PID=""; PF_PORT=""; PF_SVC=""
   return 1
 }
 
 if start_pf "thanos-querier"; then :; elif start_pf "prometheus-k8s"; then :; else
-  echo "ERROR: Could not start monitoring port-forward." >&2
+  echo "ERROR: Could not establish monitoring port-forward (thanos-querier or prometheus-k8s)." >&2
+  echo "Try manual test:" >&2
+  echo "  oc -n openshift-monitoring port-forward svc/thanos-querier 19091:9091" >&2
+  echo "  TOKEN=\$(oc whoami -t)" >&2
+  echo "  curl --http1.1 -ksS -H \"Authorization: Bearer \$TOKEN\" https://127.0.0.1:19091/api/v1/query --data-urlencode \"query=up\"" >&2
   exit 1
 fi
 
 [[ "$DEBUG" -eq 1 ]] && echo "DEBUG: monitoring via svc/${PF_SVC} on https://127.0.0.1:${PF_PORT}" >&2
 
-# ---- PromQL: get TOP N by CPU cores (fast, server-side sort) ----
-# CPU cores per VMI over WINDOW:
-#   sum by (namespace,name) (rate(kubevirt_vmi_cpu_usage_seconds_total[WINDOW]))
-# Then:
-#   topk(TOP_N, <expr>)
+# ---- Fast: server-side topk first ----
 CPU_EXPR="sum by (namespace, name) (rate(kubevirt_vmi_cpu_usage_seconds_total[${WINDOW}]))"
 TOP_CPU_Q="topk(${TOP_N}, ${CPU_EXPR})"
-
 TOP_CPU_JSON="$(mon_post "$TOP_CPU_Q")"
+
 jq -e '.status=="success"' >/dev/null 2>&1 <<<"$TOP_CPU_JSON" || {
   echo "ERROR: topk CPU query failed. Raw:" >&2
   echo "$TOP_CPU_JSON" >&2
   exit 1
 }
 
-# Extract list of ns/name + cpuCores
 TOP_LIST_TSV="$(
-  jq -r '
-    .data.result[]
-    | [.metric.namespace, .metric.name, (.value[1]|tonumber)]
-    | @tsv
-  ' <<<"$TOP_CPU_JSON"
+  jq -r '.data.result[] | [.metric.namespace, .metric.name, (.value[1]|tonumber)] | @tsv' <<<"$TOP_CPU_JSON"
 )"
 
 if [[ -z "$TOP_LIST_TSV" ]]; then
-  echo "No CPU series returned from topk query (unexpected given earlier counts)."
+  echo "No results from topk query."
   exit 0
 fi
 
-# Build a set of wanted keys for fast filtering later
 WANTED_KEYS_JSON="$(jq -Rn --arg s "$TOP_LIST_TSV" '
   ($s | split("\n") | map(select(length>0))) as $lines
   | reduce $lines[] as $l ({}; ($l|split("\t")) as $p | . + { ($p[0]+"/"+$p[1]): ($p[2]|tonumber) })
 ')"
 
-# Pull *all* VMIs once, but filter in jq using the small wanted set (fast)
-# (This is much faster than joining 1437 metrics in jq.)
+# Optional wedge metrics (maps) — only if MODE=wedge
+RX_MAP="{}"; TX_MAP="{}"; RD_MAP="{}"; WR_MAP="{}"
+if [[ "$MODE" == "wedge" ]]; then
+  to_map='
+    .data.result
+    | reduce .[] as $r ({}; . + { (($r.metric.namespace + "/" + $r.metric.name)): ($r.value[1]|tonumber) })
+  '
+  RX_JSON="$(mon_post "sum by (namespace, name) (rate(kubevirt_vmi_network_receive_bytes_total[${WINDOW}]))" 2>/dev/null || echo '{"status":"success","data":{"result":[]}}')"
+  TX_JSON="$(mon_post "sum by (namespace, name) (rate(kubevirt_vmi_network_transmit_bytes_total[${WINDOW}]))" 2>/dev/null || echo '{"status":"success","data":{"result":[]}}')"
+  RD_JSON="$(mon_post "sum by (namespace, name) (rate(kubevirt_vmi_storage_read_traffic_bytes_total[${WINDOW}]))" 2>/dev/null || echo '{"status":"success","data":{"result":[]}}')"
+  WR_JSON="$(mon_post "sum by (namespace, name) (rate(kubevirt_vmi_storage_write_traffic_bytes_total[${WINDOW}]))" 2>/dev/null || echo '{"status":"success","data":{"result":[]}}')"
+
+  RX_MAP="$(jq -c "$to_map" <<<"$RX_JSON" 2>/dev/null || echo '{}')"
+  TX_MAP="$(jq -c "$to_map" <<<"$TX_JSON" 2>/dev/null || echo '{}')"
+  RD_MAP="$(jq -c "$to_map" <<<"$RD_JSON" 2>/dev/null || echo '{}')"
+  WR_MAP="$(jq -c "$to_map" <<<"$WR_JSON" 2>/dev/null || echo '{}')"
+fi
+
+# Pull VMIs once and filter to wanted keys (fast)
 VMI_JSON="$(oc get "${VMI_RES}" -A -o json)"
 
-# Output header
 echo "Monitoring: svc/${PF_SVC} via https://127.0.0.1:${PF_PORT}"
 echo "Mode=${MODE} Window=${WINDOW} Top=${TOP_N}"
 if [[ "$MODE" == "wedge" ]]; then
@@ -162,34 +187,8 @@ if [[ "$MODE" == "wedge" ]]; then
 fi
 echo
 
-# Optional: if wedge mode, pull net/disk for just these VMIs (still small)
-NET_RX_Q="sum by (namespace, name) (rate(kubevirt_vmi_network_receive_bytes_total[${WINDOW}]))"
-NET_TX_Q="sum by (namespace, name) (rate(kubevirt_vmi_network_transmit_bytes_total[${WINDOW}]))"
-DSK_RD_Q="sum by (namespace, name) (rate(kubevirt_vmi_storage_read_traffic_bytes_total[${WINDOW}]))"
-DSK_WR_Q="sum by (namespace, name) (rate(kubevirt_vmi_storage_write_traffic_bytes_total[${WINDOW}]))"
-
-RX_MAP="{}"; TX_MAP="{}"; RD_MAP="{}"; WR_MAP="{}"
-if [[ "$MODE" == "wedge" ]]; then
-  # These are still full queries; acceptable, but you can optimize later by label matching.
-  RX_JSON="$(mon_post "$NET_RX_Q" 2>/dev/null || echo '{"status":"success","data":{"result":[]}}')"
-  TX_JSON="$(mon_post "$NET_TX_Q" 2>/dev/null || echo '{"status":"success","data":{"result":[]}}')"
-  RD_JSON="$(mon_post "$DSK_RD_Q" 2>/dev/null || echo '{"status":"success","data":{"result":[]}}')"
-  WR_JSON="$(mon_post "$DSK_WR_Q" 2>/dev/null || echo '{"status":"success","data":{"result":[]}}')"
-
-  to_map='
-    .data.result
-    | reduce .[] as $r ({}; . + { (($r.metric.namespace + "/" + $r.metric.name)): ($r.value[1]|tonumber) })
-  '
-  RX_MAP="$(jq -c "$to_map" <<<"$RX_JSON" 2>/dev/null || echo '{}')"
-  TX_MAP="$(jq -c "$to_map" <<<"$to_map" <<<"$TX_JSON" 2>/dev/null || echo '{}')"
-  RD_MAP="$(jq -c "$to_map" <<<"$RD_JSON" 2>/dev/null || echo '{}')"
-  WR_MAP="$(jq -c "$to_map" <<<"$WR_JSON" 2>/dev/null || echo '{}')"
-fi
-
-# Produce final table
-# vCPU count computed from spec (cores*sockets*threads; defaults to 1)
-echo -e "NODE\tNAMESPACE\tVMI\tVM(owner)\tvCPU\tCPU(cores)\tCPU(%)\tNET(B/s)\tDISK(B/s)" \
-| (command -v column >/dev/null 2>&1 && column -t -s $'\t' || cat)
+HEADER=$'NODE\tNAMESPACE\tVMI\tVM(owner)\tvCPU\tCPU(cores)\tCPU(%)\tNET(B/s)\tDISK(B/s)'
+printf "%s\n" "$HEADER" | (command -v column >/dev/null 2>&1 && column -t -s $'\t' || cat)
 
 jq -r --argjson wanted "$WANTED_KEYS_JSON" \
       --argjson rx "$RX_MAP" --argjson tx "$TX_MAP" --argjson rd "$RD_MAP" --argjson wr "$WR_MAP" \
