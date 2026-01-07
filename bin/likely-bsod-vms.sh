@@ -15,12 +15,12 @@ DEFAULT_DISK_MAX_BPS=20000
 DEFAULT_IOWAIT_MIN_CORES=0
 DEFAULT_DELAY_MIN_CORES=0
 
-DEFAULT_STEADY=1              # 1=use steady refinement in wedge mode
+DEFAULT_STEADY=1
 DEFAULT_JITTER_MAX_PCT=15
 DEFAULT_PEAKAVG_MAX_PCT=15
-DEFAULT_STEADY_ONLY=0         # 1=require steady (even in top), 0=just use for wedge filtering if steady=1
+DEFAULT_STEADY_ONLY=0
 
-DEFAULT_LIMIT=0               # 0=unlimited
+DEFAULT_LIMIT=0
 
 # -----------------------------
 # Parsed args -> variables
@@ -263,7 +263,6 @@ CPU_STD_MAP="$(mon_post "${CPU_STD_CORES_Q}" | jq -c "$to_map" 2>/dev/null || ec
 IOW_MAP="$(mon_post "sum by (namespace, name) (rate(kubevirt_vmi_vcpu_wait_seconds_total[${WINDOW}]))" | jq -c "$to_map" 2>/dev/null || echo '{}')"
 DLY_MAP="$(mon_post "sum by (namespace, name) (irate(kubevirt_vmi_vcpu_delay_seconds_total[${WINDOW}]))" | jq -c "$to_map" 2>/dev/null || echo '{}')"
 
-# Always query net/disk so top mode shows real values too
 RX_MAP="$(mon_post "sum by (namespace, name) (rate(kubevirt_vmi_network_receive_bytes_total[${WINDOW}]))" | jq -c "$to_map" 2>/dev/null || echo '{}')"
 TX_MAP="$(mon_post "sum by (namespace, name) (rate(kubevirt_vmi_network_transmit_bytes_total[${WINDOW}]))" | jq -c "$to_map" 2>/dev/null || echo '{}')"
 RD_MAP="$(mon_post "sum by (namespace, name) (rate(kubevirt_vmi_storage_read_traffic_bytes_total[${WINDOW}]))" | jq -c "$to_map" 2>/dev/null || echo '{}')"
@@ -307,20 +306,19 @@ jq -r \
   def f2(x): (x|tonumber) as $v | ( ($v*100 | round) / 100 );
   def i0(x): (x|tonumber | round);
 
-  # Normalize helper: maps values into 0..1 where 1 is "more suspicious"
   def clamp01(x): if x < 0 then 0 elif x > 1 then 1 else x end;
 
-  # Suspicion score ~ 0..120
-  # - base = avg CPU%
-  # - + quiet bonus if net/disk are below thresholds
-  # - + steady bonus if jitter/peakavg are low
-  def score(avgPct; net; disk; jitter; peakavg; iow; dly; netThr; diskThr; jitThr; peakThr):
-    (avgPct)
-    + 20 * clamp01((netThr - net) / netThr)
-    + 20 * clamp01((diskThr - disk) / diskThr)
-    + 10 * clamp01((jitThr - jitter) / jitThr)
-    + 10 * clamp01((peakThr - peakavg) / peakThr)
-    + (iow*10) + (dly*10);
+  # Option A score: 0..100
+  #  - CPU contributes 0..60 (avg CPU% / 100 * 60)
+  #  - quiet net contributes 0..15
+  #  - quiet disk contributes 0..15
+  #  - steady contributes 0..10 (5 jitter + 5 peakavg)
+  def score100(avgPct; net; disk; jitter; peakavg; netThr; diskThr; jitThr; peakThr):
+    (60 * clamp01((avgPct|tonumber) / 100))
+    + (15 * clamp01(((netThr|tonumber) - (net|tonumber)) / (netThr|tonumber)))
+    + (15 * clamp01(((diskThr|tonumber) - (disk|tonumber)) / (diskThr|tonumber)))
+    + ( 5 * clamp01(((jitThr|tonumber) - (jitter|tonumber)) / (jitThr|tonumber)))
+    + ( 5 * clamp01(((peakThr|tonumber) - (peakavg|tonumber)) / (peakThr|tonumber)));
 
   [
     .items[]
@@ -348,8 +346,8 @@ jq -r \
 
     | ( ((.metadata.ownerReferences // []) | map(select(.kind=="VirtualMachine"))[0].name) // "" ) as $vmOwner
 
-    | (score(
-        $avgPct; $netBps; $diskBps; $jitterPct; $peakavgPct; $iowC; $dlyC;
+    | (score100(
+        $avgPct; $netBps; $diskBps; $jitterPct; $peakavgPct;
         ($netMax|tonumber); ($diskMax|tonumber); ($jitterMax|tonumber); ($peakavgMax|tonumber)
       )) as $score
 
