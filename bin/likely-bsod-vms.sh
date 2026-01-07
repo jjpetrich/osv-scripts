@@ -7,9 +7,8 @@ MODE="${MODE:-top}"            # top | wedge
 THRESH_PCT="${THRESH_PCT:-90}" # wedge: CPU%
 NET_MAX_BPS="${NET_MAX_BPS:-50000}"
 DISK_MAX_BPS="${DISK_MAX_BPS:-50000}"
-# Optional thresholds for refinement (wedge mode)
-IOWAIT_MIN_CORES="${IOWAIT_MIN_CORES:-0}"  # e.g. 0.1 means at least 0.1 cores waiting
-DELAY_MIN_CORES="${DELAY_MIN_CORES:-0}"    # e.g. 0.1 means at least 0.1 cores delayed
+IOWAIT_MIN_CORES="${IOWAIT_MIN_CORES:-0}"
+DELAY_MIN_CORES="${DELAY_MIN_CORES:-0}"
 DEBUG=0
 INSPECT_NS=""
 INSPECT_VMI=""
@@ -23,7 +22,6 @@ Usage:
 
 Extra wedge refinements:
   IOWAIT_MIN_CORES=0.1 DELAY_MIN_CORES=0.05 MODE=wedge ... $0
-
 EOF
 }
 
@@ -128,8 +126,6 @@ if start_pf "thanos-querier"; then :; elif start_pf "prometheus-k8s"; then :; el
   exit 1
 fi
 
-[[ "$DEBUG" -eq 1 ]] && echo "DEBUG: monitoring via svc/${PF_SVC} on https://127.0.0.1:${PF_PORT}" >&2
-
 # ---- Inspect mode ----
 if [[ -n "${INSPECT_NS:-}" && -n "${INSPECT_VMI:-}" ]]; then
   echo "Monitoring: svc/${PF_SVC} via https://127.0.0.1:${PF_PORT}"
@@ -179,13 +175,11 @@ WANTED_KEYS_JSON="$(jq -Rn --arg s "$TOP_LIST_TSV" '
   | reduce $lines[] as $l ({}; ($l|split("\t")) as $p | . + { ($p[0]+"/"+$p[1]): ($p[2]|tonumber) })
 ')"
 
-# ---- Supporting maps (cluster-wide aggregated by namespace,name) ----
 to_map='
   .data.result
   | reduce .[] as $r ({}; . + { (($r.metric.namespace + "/" + $r.metric.name)): ($r.value[1]|tonumber) })
 '
 
-# Always fetch iowait/delay (cheap and useful even in top mode)
 IOW_JSON="$(mon_post "sum by (namespace, name) (rate(kubevirt_vmi_vcpu_wait_seconds_total[${WINDOW}]))" 2>/dev/null || echo '{"status":"success","data":{"result":[]}}')"
 DLY_JSON="$(mon_post "sum by (namespace, name) (irate(kubevirt_vmi_vcpu_delay_seconds_total[${WINDOW}]))" 2>/dev/null || echo '{"status":"success","data":{"result":[]}}')"
 IOW_MAP="$(jq -c "$to_map" <<<"$IOW_JSON" 2>/dev/null || echo '{}')"
@@ -202,19 +196,7 @@ if [[ "$MODE" == "wedge" ]]; then
   TX_MAP="$(jq -c "$to_map" <<<"$TX_JSON" 2>/dev/null || echo '{}')"
   RD_MAP="$(jq -c "$to_map" <<<"$RD_JSON" 2>/dev/null || echo '{}')"
   WR_MAP="$(jq -c "$to_map" <<<"$WR_JSON" 2>/dev/null || echo '{}')"
-
-  [[ "$DEBUG" -eq 1 ]] && {
-    echo "DEBUG: rx entries: $(jq 'length' <<<"$RX_MAP")" >&2
-    echo "DEBUG: tx entries: $(jq 'length' <<<"$TX_MAP")" >&2
-    echo "DEBUG: rd entries: $(jq 'length' <<<"$RD_MAP")" >&2
-    echo "DEBUG: wr entries: $(jq 'length' <<<"$WR_MAP")" >&2
-  }
 fi
-
-[[ "$DEBUG" -eq 1 ]] && {
-  echo "DEBUG: iowait entries: $(jq 'length' <<<"$IOW_MAP")" >&2
-  echo "DEBUG: delay entries: $(jq 'length' <<<"$DLY_MAP")" >&2
-}
 
 VMI_JSON="$(oc get "${VMI_RES}" -A -o json)"
 
@@ -238,10 +220,11 @@ jq -r --argjson wanted "$WANTED_KEYS_JSON" \
      (v.spec.domain.cpu.sockets // 1) *
      (v.spec.domain.cpu.threads // 1));
   def pct(a;b): if b <= 0 then 0 else (a / b * 100) end;
+  def score(cpuPct; iow; dly): (cpuPct) + (iow*50) + (dly*50);
 
-  # Simple score: emphasize CPU% and also add wait/delay pressure
-  def score(cpuPct; iow; dly):
-    (cpuPct) + (iow*50) + (dly*50);
+  # Formatting helpers
+  def f2(x): (x|tonumber) as $v | ( ($v*100 | round) / 100 );
+  def i0(x): (x|tonumber | round);
 
   [
     .items[]
@@ -279,7 +262,6 @@ jq -r --argjson wanted "$WANTED_KEYS_JSON" \
         | map(select(.cpuPct >= ($thresh|tonumber)))
         | map(select(.net <= ($netmax|tonumber)))
         | map(select(.disk <= ($diskmax|tonumber)))
-        # optional refinements (only apply if >0)
         | (if ($iowmin|tonumber) > 0 then map(select(.iow >= ($iowmin|tonumber))) else . end)
         | (if ($dlymin|tonumber) > 0 then map(select(.dly >= ($dlymin|tonumber))) else . end)
       else
@@ -289,15 +271,15 @@ jq -r --argjson wanted "$WANTED_KEYS_JSON" \
   | sort_by(-.score)
   | .[]
   | [
-      (.score|tostring),
+      (f2(.score)|tostring),
       .node, .ns, .vmi, .owner,
       (.vcpus|tostring),
-      (.cpuPct|tostring),
-      (.cpuCores|tostring),
-      (.iow|tostring),
-      (.dly|tostring),
-      (.net|tostring),
-      (.disk|tostring)
+      (f2(.cpuPct)|tostring),
+      (f2(.cpuCores)|tostring),
+      (f2(.iow)|tostring),
+      (f2(.dly)|tostring),
+      (i0(.net)|tostring),
+      (i0(.disk)|tostring)
     ] | @tsv
 ' <<<"$VMI_JSON" \
 | (command -v column >/dev/null 2>&1 && column -t -s $'\t' || cat)
