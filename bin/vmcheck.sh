@@ -67,12 +67,12 @@ W_VM="$DEFAULT_W_VM"
 
 usage() {
   cat <<'EOF'
-likely-bsod-vms.sh
+vmcheck.sh
 
 USAGE:
-  ./likely-bsod-vms.sh [options]
-  ./likely-bsod-vms.sh help
-  ./likely-bsod-vms.sh -h|--help
+  ./vmcheck.sh [options]
+  ./vmcheck.sh help
+  ./vmcheck.sh -h|--help
 
 MODES:
   --mode wedge   (default)  CPU>=cpu-min AND NET<=net-max AND DISK<=disk-max (+ steady if enabled)
@@ -125,10 +125,10 @@ DEBUG:
   --debug
 
 EXAMPLES:
-  ./likely-bsod-vms.sh --mode quiet
-  ./likely-bsod-vms.sh --mode quiet --net-max 5000 --quiet-net-only
-  ./likely-bsod-vms.sh --suggest-quiet
-  ./likely-bsod-vms.sh --suggest-quiet --suggest-pct 15
+  ./vmcheck.sh --mode quiet
+  ./vmcheck.sh --mode quiet --net-max 5000 --quiet-net-only
+  ./vmcheck.sh --suggest-quiet
+  ./vmcheck.sh --suggest-quiet --suggest-pct 15
 EOF
 }
 
@@ -430,7 +430,7 @@ if [[ "$SUGGEST_QUIET" -eq 1 ]]; then
   echo "  --disk-max ${DISK_P}"
   echo
   echo "Try:"
-  echo "  ./likely-bsod-vms.sh --mode quiet --cpu-min 0 --net-max ${NET_P} --disk-max ${DISK_P} --limit 50"
+  echo "  ./vmcheck.sh --mode quiet --cpu-min 0 --net-max ${NET_P} --disk-max ${DISK_P} --limit 50"
   exit 0
 fi
 
