@@ -322,7 +322,8 @@ echo "Mode=${MODE} Window=${WINDOW} TopCandidates=${TOP_N}"
 echo "Thresholds: cpu-min=${CPU_MIN_PCT}% net-max=${NET_MAX_BPS} disk-max=${DISK_MAX_BPS} jitter-max=${JITTER_MAX_PCT}% peakavg-max=${PEAKAVG_MAX_PCT}% steady=${STEADY} steady-only=${STEADY_ONLY} require-io-metrics=${REQUIRE_IO_METRICS}"
 echo
 
-HEADER=$'SCORE\tCPU_S\tNET_S\tDISK_S\tSTEADY_S\tNODE\tNAMESPACE\tVMI\tVM(owner)\tvCPU\tAVG_CPU(%)\tAVG_CPU(cores)\tMAX_CPU(%)\tJITTER(%)\tPEAK-AVG(%)\tIOWAIT(cores)\tDELAY(cores)\tNET(B/s)\tDISK(B/s)'
+#HEADER=$'SCORE\tCPU_S\tNET_S\tDISK_S\tSTEADY_S\tNODE\tNAMESPACE\tVMI\tVM(owner)\tvCPU\tAVG_CPU(%)\tAVG_CPU(cores)\tMAX_CPU(%)\tJITTER(%)\tPEAK-AVG(%)\tIOWAIT(cores)\tDELAY(cores)\tNET(B/s)\tDISK(B/s)'
+HEADER=$'SCORE\tS_CPU\tS_NET\tS_DISK\tS_STDY\tNODE\tNAMESPACE\tVMI\tVM\tvCPU\tCPU_AVG%\tCPU_AVG\tCPU_MAX%\tJITTER%\tPEAKAVG%\tIOWAIT\tDELAY\tNET_BPS\tDISK_BPS'
 printf "%s\n" "$HEADER" | (command -v column >/dev/null 2>&1 && column -t -s $'\t' || cat)
 
 jq -r \
