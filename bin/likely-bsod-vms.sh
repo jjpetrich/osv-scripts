@@ -20,9 +20,14 @@ DEFAULT_JITTER_MAX_PCT=3
 DEFAULT_PEAKAVG_MAX_PCT=3
 DEFAULT_STEADY_ONLY=0
 
-DEFAULT_REQUIRE_IO_METRICS=0  # if 1, require evidence of net or disk series
+DEFAULT_REQUIRE_IO_METRICS=0
+DEFAULT_LIMIT=0
 
-DEFAULT_LIMIT=0               # 0=unlimited
+# display widths (truncate long fields)
+DEFAULT_W_NODE=18
+DEFAULT_W_NS=18
+DEFAULT_W_VMI=28
+DEFAULT_W_VM=28
 
 # -----------------------------
 # Parsed args -> variables
@@ -44,14 +49,18 @@ LIMIT="$DEFAULT_LIMIT"
 DEBUG=0
 INSPECT_NS=""
 INSPECT_VMI=""
-
-# quiet-mode selector flags
 QUIET_NET_ONLY=0
 QUIET_DISK_ONLY=0
+SUGGEST_QUIET=0
+
+W_NODE="$DEFAULT_W_NODE"
+W_NS="$DEFAULT_W_NS"
+W_VMI="$DEFAULT_W_VMI"
+W_VM="$DEFAULT_W_VM"
 
 usage() {
   cat <<'EOF'
-likely-bsod-vms.sh - Detect "wedged" / likely-unresponsive KubeVirt VMIs using Prometheus/Thanos metrics.
+likely-bsod-vms.sh
 
 USAGE:
   ./likely-bsod-vms.sh [options]
@@ -59,74 +68,57 @@ USAGE:
   ./likely-bsod-vms.sh -h|--help
 
 MODES:
-  --mode wedge   (default)
-    Requires: CPU>=--cpu-min AND NET<=--net-max AND DISK<=--disk-max
-    Plus (if --steady): JITTER<=--jitter-max AND PEAKAVG<=--peakavg-max
+  --mode wedge   (default)  CPU>=cpu-min AND NET<=net-max AND DISK<=disk-max (+ steady if enabled)
+  --mode quiet             Quiet by IO; default selector is (NET quiet) OR (DISK quiet)
+  --mode top               Top N by CPU; no wedge/quiet filters
 
-  --mode quiet
-    Finds VMIs that are "quiet" by IO, optionally with CPU filter.
-    Default quiet logic: (NET quiet) OR (DISK quiet)
-    You can override the quiet logic:
-      --quiet-net-only   => only NET quiet
-      --quiet-disk-only  => only DISK quiet
-      (If both are set, quiet requires NET quiet AND DISK quiet)
-
-    CPU behavior in quiet mode:
-      If --cpu-min > 0, also requires CPU>=--cpu-min
-      Set --cpu-min 0 to ignore CPU entirely (useful for BSOD/unresponsive search)
-
-  --mode top
-    Shows top --top VMIs by avg CPU over --window, with IO + steadiness context.
-    (No wedge/quiet filters applied in top mode.)
-
-COMMON OPTIONS:
-  --window <dur>         e.g. 5m, 10m, 30m (default: 10m)
-  --top <N>              candidate set size for scoring (default: 200)
-  --limit <N>            limit printed rows (0 = unlimited)
+QUIET SELECTOR FLAGS (only affect --mode quiet):
+  --quiet-net-only         quiet if NET<=net-max
+  --quiet-disk-only        quiet if DISK<=disk-max
+  (If both are set: quiet requires NET quiet AND DISK quiet)
+  (If neither: NET quiet OR DISK quiet)
 
 THRESHOLDS:
-  --cpu-min <pct>        default 80
-  --net-max <bps>        default 20000
-  --disk-max <bps>       default 20000
-  --jitter-max <pct>     default 3
-  --peakavg-max <pct>    default 3
-  --iowait-min <cores>   default 0
-  --delay-min <cores>    default 0
+  --window <dur>           default 10m
+  --top <N>                default 200
+  --limit <N>              default 0 (unlimited)
+  --cpu-min <pct>          default 80 (quiet mode: set 0 to ignore CPU)
+  --net-max <bps>          default 20000
+  --disk-max <bps>         default 20000
+  --jitter-max <pct>       default 3
+  --peakavg-max <pct>      default 3
+  --iowait-min <cores>     default 0
+  --delay-min <cores>      default 0
 
 STEADY:
-  --steady / --no-steady             (default: steady on)
-  --steady-only / --no-steady-only   force steadiness filter even outside wedge/quiet core filters
+  --steady / --no-steady
+  --steady-only / --no-steady-only
 
 METRIC PRESENCE:
   --require-io-metrics / --no-require-io-metrics
-    If enabled, only include VMIs where we have evidence of net or disk series.
-    Helps avoid "missing metrics looks like 0".
+
+DISPLAY:
+  --w-node <N>             truncate NODE to N chars (default 18)
+  --w-ns <N>               truncate NS to N chars (default 18)
+  --w-vmi <N>              truncate VMI to N chars (default 28)
+  --w-vm <N>               truncate VM to N chars (default 28)
+
+HELPERS:
+  --suggest-quiet           print suggested --net-max / --disk-max based on current data then exit
 
 INSPECT:
-  --inspect <namespace> <vmi>   Print raw metric label series found for that VMI.
+  --inspect <namespace> <vmi>
 
 DEBUG:
   --debug
 
 EXAMPLES:
-  # Default wedge scan (high CPU + low IO)
-  ./likely-bsod-vms.sh
-
-  # Quiet scan for "silent/unresponsive" VMs (ignore CPU)
-  ./likely-bsod-vms.sh --mode quiet --cpu-min 0 --net-max 200 --disk-max 200 --limit 50
-
-  # Quiet scan: ONLY network quiet (look for dead network, regardless of disk)
-  ./likely-bsod-vms.sh --mode quiet --cpu-min 0 --net-max 200 --quiet-net-only --limit 50
-
-  # Quiet scan: ONLY disk quiet (look for disk-stalled VMs)
-  ./likely-bsod-vms.sh --mode quiet --cpu-min 0 --disk-max 200 --quiet-disk-only --limit 50
-
-  # Top CPU with IO context (require IO metrics to be present)
-  ./likely-bsod-vms.sh --mode top --top 30 --require-io-metrics
+  ./likely-bsod-vms.sh --mode quiet
+  ./likely-bsod-vms.sh --mode quiet --cpu-min 0 --quiet-net-only
+  ./likely-bsod-vms.sh --suggest-quiet
 EOF
 }
 
-# Accept "help" as first arg too
 if [[ "${1:-}" == "help" ]]; then usage; exit 0; fi
 
 while [[ $# -gt 0 ]]; do
@@ -134,6 +126,7 @@ while [[ $# -gt 0 ]]; do
     --mode) MODE="$2"; shift 2;;
     --window) WINDOW="$2"; shift 2;;
     --top) TOP_N="$2"; shift 2;;
+    --limit) LIMIT="$2"; shift 2;;
     --cpu-min) CPU_MIN_PCT="$2"; shift 2;;
     --net-max) NET_MAX_BPS="$2"; shift 2;;
     --disk-max) DISK_MAX_BPS="$2"; shift 2;;
@@ -149,8 +142,14 @@ while [[ $# -gt 0 ]]; do
     --no-require-io-metrics) REQUIRE_IO_METRICS=0; shift 1;;
     --quiet-net-only) QUIET_NET_ONLY=1; shift 1;;
     --quiet-disk-only) QUIET_DISK_ONLY=1; shift 1;;
-    --limit) LIMIT="$2"; shift 2;;
     --inspect) INSPECT_NS="$2"; INSPECT_VMI="$3"; shift 3;;
+    --suggest-quiet) SUGGEST_QUIET=1; shift 1;;
+
+    --w-node) W_NODE="$2"; shift 2;;
+    --w-ns) W_NS="$2"; shift 2;;
+    --w-vmi) W_VMI="$2"; shift 2;;
+    --w-vm) W_VM="$2"; shift 2;;
+
     --debug) DEBUG=1; shift 1;;
     -h|--help) usage; exit 0;;
     *) echo "Unknown arg: $1" >&2; usage; exit 2;;
@@ -200,7 +199,7 @@ pick_free_port() {
 mon_post() {
   local q="$1"
   curl --ipv4 --http1.1 -ksS \
-    --connect-timeout 2 --max-time 40 \
+    --connect-timeout 2 --max-time 60 \
     -H "Authorization: Bearer ${TOKEN}" \
     "https://127.0.0.1:${PF_PORT}/api/v1/query" \
     --data-urlencode "query=${q}"
@@ -208,7 +207,7 @@ mon_post() {
 
 wait_listening() {
   local i
-  for i in {1..120}; do
+  for i in {1..160}; do
     if curl --ipv4 --http1.1 -k -sS "https://127.0.0.1:${PF_PORT}/" >/dev/null 2>&1; then
       return 0
     fi
@@ -232,7 +231,7 @@ start_pf() {
   fi
 
   local i out
-  for i in {1..80}; do
+  for i in {1..120}; do
     out="$(mon_post "up" 2>/dev/null || true)"
     if jq -e '.status=="success"' >/dev/null 2>&1 <<<"$out"; then
       return 0
@@ -249,7 +248,6 @@ if start_pf "thanos-querier"; then :; elif start_pf "prometheus-k8s"; then :; el
   echo "ERROR: Could not establish monitoring port-forward." >&2
   exit 1
 fi
-
 [[ "$DEBUG" -eq 1 ]] && echo "DEBUG: monitoring via svc/${PF_SVC} on https://127.0.0.1:${PF_PORT}" >&2
 
 # -----------------------------
@@ -285,7 +283,7 @@ if [[ -n "${INSPECT_NS:-}" && -n "${INSPECT_VMI:-}" ]]; then
 fi
 
 # -----------------------------
-# PromQL building blocks
+# PromQL blocks
 # -----------------------------
 CPU_CORES_EXPR="sum by (namespace, name) (rate(kubevirt_vmi_cpu_usage_seconds_total[${WINDOW}]))"
 CPU_AVG_CORES_Q="avg_over_time((${CPU_CORES_EXPR})[${WINDOW}:])"
@@ -331,9 +329,58 @@ TX_MAP="$(mon_post "sum by (namespace, name) (rate(kubevirt_vmi_network_transmit
 RD_MAP="$(mon_post "sum by (namespace, name) (rate(kubevirt_vmi_storage_read_traffic_bytes_total[${WINDOW}]))" | jq -c "$to_map" 2>/dev/null || echo '{}')"
 WR_MAP="$(mon_post "sum by (namespace, name) (rate(kubevirt_vmi_storage_write_traffic_bytes_total[${WINDOW}]))" | jq -c "$to_map" 2>/dev/null || echo '{}')"
 
+# Suggest-quiet helper (based on current candidate set)
+if [[ "$SUGGEST_QUIET" -eq 1 ]]; then
+  # build a quick list of net/disk bps for the candidate set, then take p95
+  DATA_TSV="$(
+    oc get "${VMI_RES}" -A -o json | jq -r \
+      --argjson avgCpu "$WANTED_AVG_CPU_MAP" \
+      --argjson rx "$RX_MAP" --argjson tx "$TX_MAP" --argjson rd "$RD_MAP" --argjson wr "$WR_MAP" \
+      --argjson prx "$PRESENT_RX" --argjson ptx "$PRESENT_TX" --argjson prd "$PRESENT_RD" --argjson pwr "$PRESENT_WR" '
+      .items[]
+      | (.metadata.namespace + "/" + .metadata.name) as $k
+      | select(($avgCpu[$k] // null) != null)
+      | ((($prx[$k] // null) != null) or (($ptx[$k] // null) != null)) as $hasNet
+      | ((($prd[$k] // null) != null) or (($pwr[$k] // null) != null)) as $hasDisk
+      | (if $hasNet then (($rx[$k] // 0) + ($tx[$k] // 0)) else 0 end) as $net
+      | (if $hasDisk then (($rd[$k] // 0) + ($wr[$k] // 0)) else 0 end) as $disk
+      | [$net, $disk] | @tsv
+    ' | head -n 20000
+  )"
+
+  if [[ -z "$DATA_TSV" ]]; then
+    echo "No candidate data to suggest from."
+    exit 0
+  fi
+
+  # compute p95 with awk (simple, fast)
+  suggest_p95() {
+    awk '
+      { a[NR]=$1 }
+      END {
+        if (NR==0) { print 0; exit }
+        # sort
+        for (i=1;i<=NR;i++) for (j=i+1;j<=NR;j++) if (a[i]>a[j]) { t=a[i]; a[i]=a[j]; a[j]=t }
+        idx=int(NR*0.95); if (idx<1) idx=1; if (idx>NR) idx=NR;
+        printf "%.0f\n", a[idx]
+      }
+    '
+  }
+
+  NET_P95="$(printf "%s\n" "$DATA_TSV" | awk '{print $1}' | suggest_p95)"
+  DISK_P95="$(printf "%s\n" "$DATA_TSV" | awk '{print $2}' | suggest_p95)"
+
+  echo "Suggested quiet thresholds from top-candidates over WINDOW=${WINDOW}:"
+  echo "  --net-max  ${NET_P95}"
+  echo "  --disk-max ${DISK_P95}"
+  echo
+  echo "Try:"
+  echo "  ./likely-bsod-vms.sh --mode quiet --cpu-min 0 --net-max ${NET_P95} --disk-max ${DISK_P95} --limit 50"
+  exit 0
+fi
+
 VMI_JSON="$(oc get "${VMI_RES}" -A -o json)"
 
-# Describe quiet selector behavior in banner
 QUIET_DESC="net OR disk"
 if [[ "$QUIET_NET_ONLY" -eq 1 && "$QUIET_DISK_ONLY" -eq 0 ]]; then QUIET_DESC="net only"; fi
 if [[ "$QUIET_NET_ONLY" -eq 0 && "$QUIET_DISK_ONLY" -eq 1 ]]; then QUIET_DESC="disk only"; fi
@@ -345,183 +392,181 @@ echo "Thresholds: cpu-min=${CPU_MIN_PCT}% net-max=${NET_MAX_BPS} disk-max=${DISK
 echo "Flags: steady=${STEADY} steady-only=${STEADY_ONLY} require-io-metrics=${REQUIRE_IO_METRICS} quiet-selector=${QUIET_DESC}"
 echo
 
-# Shorter headers for better alignment
-HEADER=$'SCORE\tS_CPU\tS_NET\tS_DSK\tS_STDY\tNODE\tNS\tVMI\tVM\tvCPU\tCPU_AVG%\tCPU_AVG\tCPU_MAX%\tJIT%\tPKAVG%\tIOW\tDLY\tNET_BPS\tDSK_BPS'
-printf "%s\n" "$HEADER" | (command -v column >/dev/null 2>&1 && column -t -s $'\t' || cat)
+# Header + rows are combined then columnized together (best alignment)
+{
+  echo -e "SCORE\tS_CPU\tS_NET\tS_DSK\tS_STD\tNODE\tNS\tVMI\tVM\tvCPU\tCPU_AVG%\tCPU_AVG\tCPU_MAX%\tJIT%\tPKAVG%\tIOW\tDLY\tNET_BPS\tDSK_BPS"
 
-jq -r \
-  --argjson avgCpu "$WANTED_AVG_CPU_MAP" \
-  --argjson cpuMax "$CPU_MAX_MAP" \
-  --argjson cpuStd "$CPU_STD_MAP" \
-  --argjson rx "$RX_MAP" --argjson tx "$TX_MAP" --argjson rd "$RD_MAP" --argjson wr "$WR_MAP" \
-  --argjson prx "$PRESENT_RX" --argjson ptx "$PRESENT_TX" --argjson prd "$PRESENT_RD" --argjson pwr "$PRESENT_WR" \
-  --argjson iow "$IOW_MAP" --argjson dly "$DLY_MAP" \
-  --arg mode "$MODE" \
-  --arg cpuMin "$CPU_MIN_PCT" \
-  --arg netMax "$NET_MAX_BPS" \
-  --arg diskMax "$DISK_MAX_BPS" \
-  --arg steady "$STEADY" \
-  --arg steadyOnly "$STEADY_ONLY" \
-  --arg jitterMax "$JITTER_MAX_PCT" \
-  --arg peakavgMax "$PEAKAVG_MAX_PCT" \
-  --arg iowMin "$IOWAIT_MIN_CORES" \
-  --arg dlyMin "$DELAY_MIN_CORES" \
-  --arg requireIo "$REQUIRE_IO_METRICS" \
-  --arg qNetOnly "$QUIET_NET_ONLY" \
-  --arg qDiskOnly "$QUIET_DISK_ONLY" \
-  --arg limit "$LIMIT" '
-  def vcpu_count(v):
-    ((v.spec.domain.cpu.cores // 1) *
-     (v.spec.domain.cpu.sockets // 1) *
-     (v.spec.domain.cpu.threads // 1));
-  def pct(a;b): if b <= 0 then 0 else (a / b * 100) end;
+  jq -r \
+    --argjson avgCpu "$WANTED_AVG_CPU_MAP" \
+    --argjson cpuMax "$CPU_MAX_MAP" \
+    --argjson cpuStd "$CPU_STD_MAP" \
+    --argjson rx "$RX_MAP" --argjson tx "$TX_MAP" --argjson rd "$RD_MAP" --argjson wr "$WR_MAP" \
+    --argjson prx "$PRESENT_RX" --argjson ptx "$PRESENT_TX" --argjson prd "$PRESENT_RD" --argjson pwr "$PRESENT_WR" \
+    --argjson iow "$IOW_MAP" --argjson dly "$DLY_MAP" \
+    --arg mode "$MODE" \
+    --arg cpuMin "$CPU_MIN_PCT" \
+    --arg netMax "$NET_MAX_BPS" \
+    --arg diskMax "$DISK_MAX_BPS" \
+    --arg steady "$STEADY" \
+    --arg steadyOnly "$STEADY_ONLY" \
+    --arg jitterMax "$JITTER_MAX_PCT" \
+    --arg peakavgMax "$PEAKAVG_MAX_PCT" \
+    --arg iowMin "$IOWAIT_MIN_CORES" \
+    --arg dlyMin "$DELAY_MIN_CORES" \
+    --arg requireIo "$REQUIRE_IO_METRICS" \
+    --arg qNetOnly "$QUIET_NET_ONLY" \
+    --arg qDiskOnly "$QUIET_DISK_ONLY" \
+    --arg limit "$LIMIT" \
+    --arg wNode "$W_NODE" --arg wNs "$W_NS" --arg wVmi "$W_VMI" --arg wVm "$W_VM" '
+    def vcpu_count(v):
+      ((v.spec.domain.cpu.cores // 1) *
+       (v.spec.domain.cpu.sockets // 1) *
+       (v.spec.domain.cpu.threads // 1));
+    def pct(a;b): if b <= 0 then 0 else (a / b * 100) end;
+    def f2(x): (x|tonumber) as $v | ( ($v*100 | round) / 100 );
+    def i0(x): (x|tonumber | round);
+    def clamp01(x): if x < 0 then 0 elif x > 1 then 1 else x end;
 
-  def f2(x): (x|tonumber) as $v | ( ($v*100 | round) / 100 );
-  def i0(x): (x|tonumber | round);
+    def trunc(s; n):
+      (s // "") as $s
+      | (n|tonumber) as $n
+      | if ($n<=0) then $s
+        elif ($s|length) <= $n then $s
+        else ($s[0:($n-1)] + "…")
+        end;
 
-  def clamp01(x): if x < 0 then 0 elif x > 1 then 1 else x end;
+    # scoring components (0..100 total max)
+    def cpuS(avgPct): 60 * clamp01((avgPct|tonumber)/100);
+    def netS(net; thr): 15 * clamp01(((thr|tonumber) - (net|tonumber)) / (thr|tonumber));
+    def diskS(disk; thr): 15 * clamp01(((thr|tonumber) - (disk|tonumber)) / (thr|tonumber));
+    def steadyS(jitter; peakavg; jitThr; peakThr):
+      (5 * clamp01(((jitThr|tonumber) - (jitter|tonumber)) / (jitThr|tonumber)))
+      + (5 * clamp01(((peakThr|tonumber) - (peakavg|tonumber)) / (peakThr|tonumber)));
 
-  # Components (0..1) and weighted components:
-  def cpu01(avgPct): clamp01((avgPct|tonumber)/100);
-  def quiet01(val; thr): clamp01(((thr|tonumber) - (val|tonumber)) / (thr|tonumber));
-  def steady01(val; thr): clamp01(((thr|tonumber) - (val|tonumber)) / (thr|tonumber));
+    def totalScore(avgPct; net; disk; jitter; peakavg; netThr; diskThr; jitThr; peakThr):
+      cpuS(avgPct) + netS(net; netThr) + diskS(disk; diskThr) + steadyS(jitter; peakavg; jitThr; peakThr);
 
-  # Weighted explain components (sum to 100 max):
-  def cpuS(avgPct): 60 * cpu01(avgPct);
-  def netS(net; thr): 15 * quiet01(net; thr);
-  def diskS(disk; thr): 15 * quiet01(disk; thr);
-  def jitterS(jitter; thr): 5 * steady01(jitter; thr);
-  def peakS(peakavg; thr): 5 * steady01(peakavg; thr);
-  def steadyS(jitter; peakavg; jitThr; peakThr): jitterS(jitter; jitThr) + peakS(peakavg; peakThr);
-  def totalScore(avgPct; net; disk; jitter; peakavg; netThr; diskThr; jitThr; peakThr):
-    cpuS(avgPct) + netS(net; netThr) + diskS(disk; diskThr) + steadyS(jitter; peakavg; jitThr; peakThr);
+    def quietMatch(net; disk; netThr; diskThr; qNetOnly; qDiskOnly):
+      (if (qNetOnly|tonumber)==1 and (qDiskOnly|tonumber)==1 then
+          ((net|tonumber) <= (netThr|tonumber)) and ((disk|tonumber) <= (diskThr|tonumber))
+       elif (qNetOnly|tonumber)==1 then
+          ((net|tonumber) <= (netThr|tonumber))
+       elif (qDiskOnly|tonumber)==1 then
+          ((disk|tonumber) <= (diskThr|tonumber))
+       else
+          ((net|tonumber) <= (netThr|tonumber)) or ((disk|tonumber) <= (diskThr|tonumber))
+       end);
 
-  def quietMatch(net; disk; netThr; diskThr; qNetOnly; qDiskOnly):
-    (if (qNetOnly|tonumber)==1 and (qDiskOnly|tonumber)==1 then
-        ((net|tonumber) <= (netThr|tonumber)) and ((disk|tonumber) <= (diskThr|tonumber))
-     elif (qNetOnly|tonumber)==1 then
-        ((net|tonumber) <= (netThr|tonumber))
-     elif (qDiskOnly|tonumber)==1 then
-        ((disk|tonumber) <= (diskThr|tonumber))
-     else
-        ((net|tonumber) <= (netThr|tonumber)) or ((disk|tonumber) <= (diskThr|tonumber))
-     end);
+    [
+      .items[]
+      | (.metadata.namespace + "/" + .metadata.name) as $k
+      | ($avgCpu[$k] // null) as $avgCores
+      | select($avgCores != null)
+      | (.status.nodeName // "") as $node
+      | select($node != "")
+      | (vcpu_count(.)|tonumber) as $vcpus
 
-  [
-    .items[]
-    | (.metadata.namespace + "/" + .metadata.name) as $k
-    | ($avgCpu[$k] // null) as $avgCores
-    | select($avgCores != null)
-    | (.status.nodeName // "") as $node
-    | select($node != "")
-    | (vcpu_count(.)|tonumber) as $vcpus
+      | ($avgCores|tonumber) as $avgC
+      | (($cpuMax[$k] // $avgC)|tonumber) as $maxC
+      | (($cpuStd[$k] // 0)|tonumber) as $stdC
 
-    | ($avgCores|tonumber) as $avgC
-    | (($cpuMax[$k] // $avgC)|tonumber) as $maxC
-    | (($cpuStd[$k] // 0)|tonumber) as $stdC
+      | (pct($avgC; $vcpus)) as $avgPct
+      | (pct($maxC; $vcpus)) as $maxPct
 
-    | (pct($avgC; $vcpus)) as $avgPct
-    | (pct($maxC; $vcpus)) as $maxPct
+      | (if $avgC <= 0 then 0 else (100 * ($stdC / $avgC)) end) as $jitterPct
+      | (($maxPct - $avgPct)) as $peakavgPct
 
-    | (if $avgC <= 0 then 0 else (100 * ($stdC / $avgC)) end) as $jitterPct
-    | (($maxPct - $avgPct)) as $peakavgPct
+      | ((($prx[$k] // null) != null) or (($ptx[$k] // null) != null)) as $hasNetSeries
+      | ((($prd[$k] // null) != null) or (($pwr[$k] // null) != null)) as $hasDiskSeries
+      | ($hasNetSeries or $hasDiskSeries) as $hasAnyIo
+      | (if ($requireIo|tonumber) == 1 then select($hasAnyIo) else . end)
 
-    | ((($prx[$k] // null) != null) or (($ptx[$k] // null) != null)) as $hasNetSeries
-    | ((($prd[$k] // null) != null) or (($pwr[$k] // null) != null)) as $hasDiskSeries
-    | ($hasNetSeries or $hasDiskSeries) as $hasAnyIo
-    | (if ($requireIo|tonumber) == 1 then select($hasAnyIo) else . end)
+      | (if $hasNetSeries then (($rx[$k] // 0) + ($tx[$k] // 0)) else 0 end) as $netBps
+      | (if $hasDiskSeries then (($rd[$k] // 0) + ($wr[$k] // 0)) else 0 end) as $diskBps
 
-    | (if $hasNetSeries then (($rx[$k] // 0) + ($tx[$k] // 0)) else null end) as $netBpsN
-    | (if $hasDiskSeries then (($rd[$k] // 0) + ($wr[$k] // 0)) else null end) as $diskBpsN
-    | (if $netBpsN == null then 0 else $netBpsN end) as $netBps
-    | (if $diskBpsN == null then 0 else $diskBpsN end) as $diskBps
+      | (($iow[$k] // 0)|tonumber) as $iowC
+      | (($dly[$k] // 0)|tonumber) as $dlyC
 
-    | (($iow[$k] // 0)|tonumber) as $iowC
-    | (($dly[$k] // 0)|tonumber) as $dlyC
+      | ( ((.metadata.ownerReferences // []) | map(select(.kind=="VirtualMachine"))[0].name) // "" ) as $vmOwner
 
-    | ( ((.metadata.ownerReferences // []) | map(select(.kind=="VirtualMachine"))[0].name) // "" ) as $vmOwner
+      | (cpuS($avgPct)) as $cS
+      | (netS($netBps; ($netMax|tonumber))) as $nS
+      | (diskS($diskBps; ($diskMax|tonumber))) as $dS
+      | (steadyS($jitterPct; $peakavgPct; ($jitterMax|tonumber); ($peakavgMax|tonumber))) as $sS
+      | (totalScore($avgPct; $netBps; $diskBps; $jitterPct; $peakavgPct;
+                    ($netMax|tonumber); ($diskMax|tonumber); ($jitterMax|tonumber); ($peakavgMax|tonumber))) as $score
 
-    | (cpuS($avgPct)) as $cpuS
-    | (netS($netBps; ($netMax|tonumber))) as $netS
-    | (diskS($diskBps; ($diskMax|tonumber))) as $diskS
-    | (steadyS($jitterPct; $peakavgPct; ($jitterMax|tonumber); ($peakavgMax|tonumber))) as $steadyS
-    | (totalScore(
-        $avgPct; $netBps; $diskBps; $jitterPct; $peakavgPct;
-        ($netMax|tonumber); ($diskMax|tonumber); ($jitterMax|tonumber); ($peakavgMax|tonumber)
-      )) as $score
+      | {
+          score:$score, cS:$cS, nS:$nS, dS:$dS, sS:$sS,
+          node:$node, ns:.metadata.namespace, vmi:.metadata.name, owner:$vmOwner,
+          vcpus:$vcpus,
+          avgPct:$avgPct, avgC:$avgC, maxPct:$maxPct,
+          jitter:$jitterPct, peakavg:$peakavgPct,
+          iow:$iowC, dly:$dlyC,
+          net:$netBps, disk:$diskBps
+        }
+    ] as $rows
 
-    | {
-        score:$score, cpuS:$cpuS, netS:$netS, diskS:$diskS, steadyS:$steadyS,
-        node:$node, ns:.metadata.namespace, vmi:.metadata.name, owner:$vmOwner,
-        vcpus:$vcpus,
-        avgPct:$avgPct, avgC:$avgC,
-        maxPct:$maxPct,
-        jitter:$jitterPct, peakavg:$peakavgPct,
-        iow:$iowC, dly:$dlyC,
-        net:$netBps, disk:$diskBps
-      }
-  ] as $rows
+    | (
+        if $mode == "wedge" then
+          $rows
+          | map(select(.avgPct >= ($cpuMin|tonumber)))
+          | map(select(.net <= ($netMax|tonumber)))
+          | map(select(.disk <= ($diskMax|tonumber)))
+          | (if ($iowMin|tonumber) > 0 then map(select(.iow >= ($iowMin|tonumber))) else . end)
+          | (if ($dlyMin|tonumber) > 0 then map(select(.dly >= ($dlyMin|tonumber))) else . end)
+          | (if ($steady|tonumber) == 1 then
+              map(select(.jitter <= ($jitterMax|tonumber)))
+              | map(select(.peakavg <= ($peakavgMax|tonumber)))
+            else .
+            end)
 
-  | (
-      if $mode == "wedge" then
-        $rows
-        | map(select(.avgPct >= ($cpuMin|tonumber)))
-        | map(select(.net <= ($netMax|tonumber)))
-        | map(select(.disk <= ($diskMax|tonumber)))
-        | (if ($iowMin|tonumber) > 0 then map(select(.iow >= ($iowMin|tonumber))) else . end)
-        | (if ($dlyMin|tonumber) > 0 then map(select(.dly >= ($dlyMin|tonumber))) else . end)
-        | (if ($steady|tonumber) == 1 then
-            map(select(.jitter <= ($jitterMax|tonumber)))
-            | map(select(.peakavg <= ($peakavgMax|tonumber)))
-          else .
-          end)
+        elif $mode == "quiet" then
+          $rows
+          | map(select(quietMatch(.net; .disk; ($netMax|tonumber); ($diskMax|tonumber); $qNetOnly; $qDiskOnly)))
+          | (if ($cpuMin|tonumber) > 0 then map(select(.avgPct >= ($cpuMin|tonumber))) else . end)
+          | (if ($iowMin|tonumber) > 0 then map(select(.iow >= ($iowMin|tonumber))) else . end)
+          | (if ($dlyMin|tonumber) > 0 then map(select(.dly >= ($dlyMin|tonumber))) else . end)
+          | (if ($steady|tonumber) == 1 then
+              map(select(.jitter <= ($jitterMax|tonumber)))
+              | map(select(.peakavg <= ($peakavgMax|tonumber)))
+            else .
+            end)
 
-      elif $mode == "quiet" then
-        $rows
-        | map(select(quietMatch(.net; .disk; ($netMax|tonumber); ($diskMax|tonumber); $qNetOnly; $qDiskOnly)))
-        | (if ($cpuMin|tonumber) > 0 then map(select(.avgPct >= ($cpuMin|tonumber))) else . end)
-        | (if ($iowMin|tonumber) > 0 then map(select(.iow >= ($iowMin|tonumber))) else . end)
-        | (if ($dlyMin|tonumber) > 0 then map(select(.dly >= ($dlyMin|tonumber))) else . end)
-        | (if ($steady|tonumber) == 1 then
-            map(select(.jitter <= ($jitterMax|tonumber)))
-            | map(select(.peakavg <= ($peakavgMax|tonumber)))
-          else .
-          end)
+        else
+          $rows
+        end
+      )
 
-      else
-        $rows
-      end
-    )
+    | (if ($steadyOnly|tonumber) == 1 then
+         map(select(.jitter <= ($jitterMax|tonumber)))
+         | map(select(.peakavg <= ($peakavgMax|tonumber)))
+       else .
+       end)
 
-  | (if ($steadyOnly|tonumber) == 1 then
-       map(select(.jitter <= ($jitterMax|tonumber)))
-       | map(select(.peakavg <= ($peakavgMax|tonumber)))
-     else .
-     end)
-
-  | sort_by(-.score)
-  | (if ($limit|tonumber) > 0 then .[0:($limit|tonumber)] else . end)
-  | .[]
-  | [
-      (f2(.score)|tostring),
-      (f2(.cpuS)|tostring),
-      (f2(.netS)|tostring),
-      (f2(.diskS)|tostring),
-      (f2(.steadyS)|tostring),
-      .node,
-      .ns,
-      .vmi,
-      .owner,
-      (.vcpus|tostring),
-      (f2(.avgPct)|tostring),
-      (f2(.avgC)|tostring),
-      (f2(.maxPct)|tostring),
-      (f2(.jitter)|tostring),
-      (f2(.peakavg)|tostring),
-      (f2(.iow)|tostring),
-      (f2(.dly)|tostring),
-      (i0(.net)|tostring),
-      (i0(.disk)|tostring)
-    ] | @tsv
-' <<<"$VMI_JSON" \
-| (command -v column >/dev/null 2>&1 && column -t -s $'\t' || cat)
+    | sort_by(-.score)
+    | (if ($limit|tonumber) > 0 then .[0:($limit|tonumber)] else . end)
+    | .[]
+    | [
+        (f2(.score)|tostring),
+        (f2(.cS)|tostring),
+        (f2(.nS)|tostring),
+        (f2(.dS)|tostring),
+        (f2(.sS)|tostring),
+        (trunc(.node; $wNode)),
+        (trunc(.ns; $wNs)),
+        (trunc(.vmi; $wVmi)),
+        (trunc(.owner; $wVm)),
+        (.vcpus|tostring),
+        (f2(.avgPct)|tostring),
+        (f2(.avgC)|tostring),
+        (f2(.maxPct)|tostring),
+        (f2(.jitter)|tostring),
+        (f2(.peakavg)|tostring),
+        (f2(.iow)|tostring),
+        (f2(.dly)|tostring),
+        (i0(.net)|tostring),
+        (i0(.disk)|tostring)
+      ] | @tsv
+  ' <<<"$VMI_JSON"
+} | (command -v column >/dev/null 2>&1 && column -t -s $'\t' || cat)
