@@ -4,11 +4,11 @@ set -euo pipefail
 # -----------------------------
 # Defaults (override via flags)
 # -----------------------------
-DEFAULT_MODE="wedge"          # wedge | top
+DEFAULT_MODE="wedge"          # wedge | quiet | top
 DEFAULT_WINDOW="10m"
 DEFAULT_TOP_N=200
 
-DEFAULT_CPU_MIN_PCT=80
+DEFAULT_CPU_MIN_PCT=80        # used by wedge; also used by quiet unless you set it to 0
 DEFAULT_NET_MAX_BPS=20000
 DEFAULT_DISK_MAX_BPS=20000
 
@@ -16,11 +16,11 @@ DEFAULT_IOWAIT_MIN_CORES=0
 DEFAULT_DELAY_MIN_CORES=0
 
 DEFAULT_STEADY=1
-DEFAULT_JITTER_MAX_PCT=3       # tightened default
-DEFAULT_PEAKAVG_MAX_PCT=3      # tightened default
+DEFAULT_JITTER_MAX_PCT=3
+DEFAULT_PEAKAVG_MAX_PCT=3
 DEFAULT_STEADY_ONLY=0
 
-DEFAULT_REQUIRE_IO_METRICS=0   # if 1, require evidence of net/disk series (avoid "missing == 0")
+DEFAULT_REQUIRE_IO_METRICS=0  # if 1, require evidence of net/disk series
 
 DEFAULT_LIMIT=0               # 0=unlimited
 
@@ -46,39 +46,74 @@ INSPECT_NS=""
 INSPECT_VMI=""
 
 usage() {
-  cat <<EOF
-likely-bsod-vms.sh
+  cat <<'EOF'
+likely-bsod-vms.sh - Detect "wedged" / likely-unresponsive KubeVirt VMIs using Prometheus/Thanos metrics.
 
-Modes:
-  --mode wedge   (default) High avg CPU% + low net + low disk + steady CPU (by default)
-  --mode top     Show top VMIs by avg CPU% (still includes NET/DISK and steady stats)
+USAGE:
+  ./likely-bsod-vms.sh [options]
 
-Defaults (override via flags):
-  --window $DEFAULT_WINDOW
-  --top $DEFAULT_TOP_N
-  --cpu-min $DEFAULT_CPU_MIN_PCT
-  --net-max $DEFAULT_NET_MAX_BPS
-  --disk-max $DEFAULT_DISK_MAX_BPS
-  --steady / --no-steady
-  --jitter-max $DEFAULT_JITTER_MAX_PCT
-  --peakavg-max $DEFAULT_PEAKAVG_MAX_PCT
-  --steady-only / --no-steady-only
-  --iowait-min $DEFAULT_IOWAIT_MIN_CORES
-  --delay-min $DEFAULT_DELAY_MIN_CORES
+MODES:
+  --mode wedge   (default)
+    High CPU + low IO + steady CPU (if enabled)
+    Typical use: find "spinlock" / runaway CPU with little network/disk.
+
+  --mode quiet
+    IO-quiet first (low net/disk), optionally also require CPU >= --cpu-min.
+    Typical use: find "unresponsive/BSOD-like" VMs that go silent (CPU might be low or high).
+    Tip: set --cpu-min 0 to ignore CPU entirely.
+
+  --mode top
+    Show top N VMIs by avg CPU over --window, with IO + steadiness context.
+
+COMMON OPTIONS:
+  --window <dur>         Prometheus range, e.g. 5m, 10m, 30m (default: 10m)
+  --top <N>              Top candidates by CPU (default: 200; in top mode this is your list size)
+  --limit <N>            Limit printed rows (0 = unlimited)
+
+THRESHOLDS (used for filtering + scoring):
+  --cpu-min <pct>        Default 80. In quiet mode set to 0 to ignore.
+  --net-max <bps>        Default 20000
+  --disk-max <bps>       Default 20000
+  --jitter-max <pct>     Default 3
+  --peakavg-max <pct>    Default 3
+  --iowait-min <cores>   Default 0
+  --delay-min <cores>    Default 0
+
+STEADY BEHAVIOR:
+  --steady / --no-steady             (default: steady on)
+  --steady-only / --no-steady-only   If on, requires steadiness even outside wedge filters
+
+METRIC PRESENCE:
   --require-io-metrics / --no-require-io-metrics
-  --limit $DEFAULT_LIMIT   (0 = unlimited)
+    If enabled, only include VMIs where we have evidence of net or disk series.
+    Useful to avoid "missing metrics looks like 0".
 
-Inspect:
-  --inspect <namespace> <vmi>
+INSPECT:
+  --inspect <namespace> <vmi>   Print raw metric label series found for that VMI.
 
-Examples:
+DEBUG:
+  --debug
+
+EXAMPLES:
+  # Default wedge scan (good "wedged high CPU" detector)
   ./likely-bsod-vms.sh
-  ./likely-bsod-vms.sh --require-io-metrics
+
+  # Quiet scan for silent/unresponsive VMs (ignore CPU)
+  ./likely-bsod-vms.sh --mode quiet --cpu-min 0 --net-max 200 --disk-max 200
+
+  # Tight wedge scan
+  ./likely-bsod-vms.sh --cpu-min 90 --net-max 1000 --disk-max 1000
+
+  # Show top CPU VMIs with IO context
   ./likely-bsod-vms.sh --mode top --top 30
-  ./likely-bsod-vms.sh --cpu-min 90 --net-max 10000 --disk-max 10000
-  ./likely-bsod-vms.sh --no-steady
+
+  # Avoid false "quiet" from missing IO metrics
+  ./likely-bsod-vms.sh --mode top --top 30 --require-io-metrics
 EOF
 }
+
+# Accept "help" as first arg too
+if [[ "${1:-}" == "help" ]]; then usage; exit 0; fi
 
 while [[ $# -gt 0 ]]; do
   case "$1" in
@@ -270,7 +305,6 @@ CPU_STD_MAP="$(mon_post "${CPU_STD_CORES_Q}" | jq -c "$to_map" 2>/dev/null || ec
 IOW_MAP="$(mon_post "sum by (namespace, name) (rate(kubevirt_vmi_vcpu_wait_seconds_total[${WINDOW}]))" | jq -c "$to_map" 2>/dev/null || echo '{}')"
 DLY_MAP="$(mon_post "sum by (namespace, name) (irate(kubevirt_vmi_vcpu_delay_seconds_total[${WINDOW}]))" | jq -c "$to_map" 2>/dev/null || echo '{}')"
 
-# Note: we build *presence* maps (did we see any series for this ns/name?)
 PRESENT_RX="$(mon_post "count by (namespace, name) (rate(kubevirt_vmi_network_receive_bytes_total[${WINDOW}]))" | jq -c "$to_map" 2>/dev/null || echo '{}')"
 PRESENT_TX="$(mon_post "count by (namespace, name) (rate(kubevirt_vmi_network_transmit_bytes_total[${WINDOW}]))" | jq -c "$to_map" 2>/dev/null || echo '{}')"
 PRESENT_RD="$(mon_post "count by (namespace, name) (rate(kubevirt_vmi_storage_read_traffic_bytes_total[${WINDOW}]))" | jq -c "$to_map" 2>/dev/null || echo '{}')"
@@ -285,10 +319,10 @@ VMI_JSON="$(oc get "${VMI_RES}" -A -o json)"
 
 echo "Monitoring: svc/${PF_SVC} via https://127.0.0.1:${PF_PORT}"
 echo "Mode=${MODE} Window=${WINDOW} TopCandidates=${TOP_N}"
-echo "Filters: CPU>=${CPU_MIN_PCT}% net<=${NET_MAX_BPS} disk<=${DISK_MAX_BPS} steady=${STEADY} steady-only=${STEADY_ONLY} jitter<=${JITTER_MAX_PCT}% peak-avg<=${PEAKAVG_MAX_PCT}% iowait>=${IOWAIT_MIN_CORES} delay>=${DELAY_MIN_CORES} require-io-metrics=${REQUIRE_IO_METRICS}"
+echo "Thresholds: cpu-min=${CPU_MIN_PCT}% net-max=${NET_MAX_BPS} disk-max=${DISK_MAX_BPS} jitter-max=${JITTER_MAX_PCT}% peakavg-max=${PEAKAVG_MAX_PCT}% steady=${STEADY} steady-only=${STEADY_ONLY} require-io-metrics=${REQUIRE_IO_METRICS}"
 echo
 
-HEADER=$'SCORE\tNODE\tNAMESPACE\tVMI\tVM(owner)\tvCPU\tAVG_CPU(%)\tAVG_CPU(cores)\tMAX_CPU(%)\tJITTER(%)\tPEAK-AVG(%)\tIOWAIT(cores)\tDELAY(cores)\tNET(B/s)\tDISK(B/s)'
+HEADER=$'SCORE\tCPU_S\tNET_S\tDISK_S\tSTEADY_S\tNODE\tNAMESPACE\tVMI\tVM(owner)\tvCPU\tAVG_CPU(%)\tAVG_CPU(cores)\tMAX_CPU(%)\tJITTER(%)\tPEAK-AVG(%)\tIOWAIT(cores)\tDELAY(cores)\tNET(B/s)\tDISK(B/s)'
 printf "%s\n" "$HEADER" | (command -v column >/dev/null 2>&1 && column -t -s $'\t' || cat)
 
 jq -r \
@@ -321,13 +355,21 @@ jq -r \
 
   def clamp01(x): if x < 0 then 0 elif x > 1 then 1 else x end;
 
-  # Option A score: 0..100
-  def score100(avgPct; net; disk; jitter; peakavg; netThr; diskThr; jitThr; peakThr):
-    (60 * clamp01((avgPct|tonumber) / 100))
-    + (15 * clamp01(((netThr|tonumber) - (net|tonumber)) / (netThr|tonumber)))
-    + (15 * clamp01(((diskThr|tonumber) - (disk|tonumber)) / (diskThr|tonumber)))
-    + ( 5 * clamp01(((jitThr|tonumber) - (jitter|tonumber)) / (jitThr|tonumber)))
-    + ( 5 * clamp01(((peakThr|tonumber) - (peakavg|tonumber)) / (peakThr|tonumber)));
+  # Components (0..1) and weighted components:
+  def cpu01(avgPct): clamp01((avgPct|tonumber)/100);
+  def quiet01(val; thr): clamp01(((thr|tonumber) - (val|tonumber)) / (thr|tonumber));
+  def steady01(val; thr): clamp01(((thr|tonumber) - (val|tonumber)) / (thr|tonumber));
+
+  # Weighted explain components:
+  def cpuS(avgPct): 60 * cpu01(avgPct);
+  def netS(net; thr): 15 * quiet01(net; thr);
+  def diskS(disk; thr): 15 * quiet01(disk; thr);
+  def jitterS(jitter; thr): 5 * steady01(jitter; thr);
+  def peakS(peakavg; thr): 5 * steady01(peakavg; thr);
+  def steadyS(jitter; peakavg; jitThr; peakThr): jitterS(jitter; jitThr) + peakS(peakavg; peakThr);
+
+  def totalScore(avgPct; net; disk; jitter; peakavg; netThr; diskThr; jitThr; peakThr):
+    cpuS(avgPct) + netS(net; netThr) + diskS(disk; diskThr) + steadyS(jitter; peakavg; jitThr; peakThr);
 
   [
     .items[]
@@ -348,20 +390,13 @@ jq -r \
     | (if $avgC <= 0 then 0 else (100 * ($stdC / $avgC)) end) as $jitterPct
     | (($maxPct - $avgPct)) as $peakavgPct
 
-    # Detect whether we have evidence of IO series
     | ((($prx[$k] // null) != null) or (($ptx[$k] // null) != null)) as $hasNetSeries
     | ((($prd[$k] // null) != null) or (($pwr[$k] // null) != null)) as $hasDiskSeries
     | ($hasNetSeries or $hasDiskSeries) as $hasAnyIo
+    | (if ($requireIo|tonumber) == 1 then select($hasAnyIo) else . end)
 
-    # Use null for missing; only coerce to 0 if not requiring metrics (for display/compat)
     | (if $hasNetSeries then (($rx[$k] // 0) + ($tx[$k] // 0)) else null end) as $netBpsN
     | (if $hasDiskSeries then (($rd[$k] // 0) + ($wr[$k] // 0)) else null end) as $diskBpsN
-
-    | (if ($requireIo|tonumber) == 1 then
-         select($hasAnyIo)
-       else .
-       end)
-
     | (if $netBpsN == null then 0 else $netBpsN end) as $netBps
     | (if $diskBpsN == null then 0 else $diskBpsN end) as $diskBps
 
@@ -370,13 +405,20 @@ jq -r \
 
     | ( ((.metadata.ownerReferences // []) | map(select(.kind=="VirtualMachine"))[0].name) // "" ) as $vmOwner
 
-    | (score100(
+    # Explain components
+    | (cpuS($avgPct)) as $cpuS
+    | (netS($netBps; ($netMax|tonumber))) as $netS
+    | (diskS($diskBps; ($diskMax|tonumber))) as $diskS
+    | (steadyS($jitterPct; $peakavgPct; ($jitterMax|tonumber); ($peakavgMax|tonumber))) as $steadyS
+    | (totalScore(
         $avgPct; $netBps; $diskBps; $jitterPct; $peakavgPct;
         ($netMax|tonumber); ($diskMax|tonumber); ($jitterMax|tonumber); ($peakavgMax|tonumber)
       )) as $score
 
     | {
-        score:$score, node:$node, ns:.metadata.namespace, vmi:.metadata.name, owner:$vmOwner,
+        score:$score,
+        cpuS:$cpuS, netS:$netS, diskS:$diskS, steadyS:$steadyS,
+        node:$node, ns:.metadata.namespace, vmi:.metadata.name, owner:$vmOwner,
         vcpus:$vcpus,
         avgPct:$avgPct, avgC:$avgC,
         maxPct:$maxPct,
@@ -399,6 +441,18 @@ jq -r \
             | map(select(.peakavg <= ($peakavgMax|tonumber)))
           else .
           end)
+      elif $mode == "quiet" then
+        $rows
+        | map(select(.net <= ($netMax|tonumber)))
+        | map(select(.disk <= ($diskMax|tonumber)))
+        | (if ($cpuMin|tonumber) > 0 then map(select(.avgPct >= ($cpuMin|tonumber))) else . end)
+        | (if ($iowMin|tonumber) > 0 then map(select(.iow >= ($iowMin|tonumber))) else . end)
+        | (if ($dlyMin|tonumber) > 0 then map(select(.dly >= ($dlyMin|tonumber))) else . end)
+        | (if ($steady|tonumber) == 1 then
+            map(select(.jitter <= ($jitterMax|tonumber)))
+            | map(select(.peakavg <= ($peakavgMax|tonumber)))
+          else .
+          end)
       else
         $rows
       end
@@ -413,6 +467,10 @@ jq -r \
   | .[]
   | [
       (f2(.score)|tostring),
+      (f2(.cpuS)|tostring),
+      (f2(.netS)|tostring),
+      (f2(.diskS)|tostring),
+      (f2(.steadyS)|tostring),
       .node, .ns, .vmi, .owner,
       (.vcpus|tostring),
       (f2(.avgPct)|tostring),
