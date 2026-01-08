@@ -16,11 +16,13 @@ DEFAULT_IOWAIT_MIN_CORES=0
 DEFAULT_DELAY_MIN_CORES=0
 
 DEFAULT_STEADY=1
-DEFAULT_JITTER_MAX_PCT=15
-DEFAULT_PEAKAVG_MAX_PCT=15
+DEFAULT_JITTER_MAX_PCT=3       # tightened default
+DEFAULT_PEAKAVG_MAX_PCT=3      # tightened default
 DEFAULT_STEADY_ONLY=0
 
-DEFAULT_LIMIT=0
+DEFAULT_REQUIRE_IO_METRICS=0   # if 1, require evidence of net/disk series (avoid "missing == 0")
+
+DEFAULT_LIMIT=0               # 0=unlimited
 
 # -----------------------------
 # Parsed args -> variables
@@ -37,6 +39,7 @@ STEADY="$DEFAULT_STEADY"
 JITTER_MAX_PCT="$DEFAULT_JITTER_MAX_PCT"
 PEAKAVG_MAX_PCT="$DEFAULT_PEAKAVG_MAX_PCT"
 STEADY_ONLY="$DEFAULT_STEADY_ONLY"
+REQUIRE_IO_METRICS="$DEFAULT_REQUIRE_IO_METRICS"
 LIMIT="$DEFAULT_LIMIT"
 DEBUG=0
 INSPECT_NS=""
@@ -47,7 +50,7 @@ usage() {
 likely-bsod-vms.sh
 
 Modes:
-  --mode wedge   (default) High avg CPU% + low net + low disk + (optionally) steady CPU filters
+  --mode wedge   (default) High avg CPU% + low net + low disk + steady CPU (by default)
   --mode top     Show top VMIs by avg CPU% (still includes NET/DISK and steady stats)
 
 Defaults (override via flags):
@@ -62,6 +65,7 @@ Defaults (override via flags):
   --steady-only / --no-steady-only
   --iowait-min $DEFAULT_IOWAIT_MIN_CORES
   --delay-min $DEFAULT_DELAY_MIN_CORES
+  --require-io-metrics / --no-require-io-metrics
   --limit $DEFAULT_LIMIT   (0 = unlimited)
 
 Inspect:
@@ -69,6 +73,7 @@ Inspect:
 
 Examples:
   ./likely-bsod-vms.sh
+  ./likely-bsod-vms.sh --require-io-metrics
   ./likely-bsod-vms.sh --mode top --top 30
   ./likely-bsod-vms.sh --cpu-min 90 --net-max 10000 --disk-max 10000
   ./likely-bsod-vms.sh --no-steady
@@ -91,6 +96,8 @@ while [[ $# -gt 0 ]]; do
     --peakavg-max) PEAKAVG_MAX_PCT="$2"; shift 2;;
     --steady-only) STEADY_ONLY=1; shift 1;;
     --no-steady-only) STEADY_ONLY=0; shift 1;;
+    --require-io-metrics) REQUIRE_IO_METRICS=1; shift 1;;
+    --no-require-io-metrics) REQUIRE_IO_METRICS=0; shift 1;;
     --limit) LIMIT="$2"; shift 2;;
     --inspect) INSPECT_NS="$2"; INSPECT_VMI="$3"; shift 3;;
     --debug) DEBUG=1; shift 1;;
@@ -263,6 +270,12 @@ CPU_STD_MAP="$(mon_post "${CPU_STD_CORES_Q}" | jq -c "$to_map" 2>/dev/null || ec
 IOW_MAP="$(mon_post "sum by (namespace, name) (rate(kubevirt_vmi_vcpu_wait_seconds_total[${WINDOW}]))" | jq -c "$to_map" 2>/dev/null || echo '{}')"
 DLY_MAP="$(mon_post "sum by (namespace, name) (irate(kubevirt_vmi_vcpu_delay_seconds_total[${WINDOW}]))" | jq -c "$to_map" 2>/dev/null || echo '{}')"
 
+# Note: we build *presence* maps (did we see any series for this ns/name?)
+PRESENT_RX="$(mon_post "count by (namespace, name) (rate(kubevirt_vmi_network_receive_bytes_total[${WINDOW}]))" | jq -c "$to_map" 2>/dev/null || echo '{}')"
+PRESENT_TX="$(mon_post "count by (namespace, name) (rate(kubevirt_vmi_network_transmit_bytes_total[${WINDOW}]))" | jq -c "$to_map" 2>/dev/null || echo '{}')"
+PRESENT_RD="$(mon_post "count by (namespace, name) (rate(kubevirt_vmi_storage_read_traffic_bytes_total[${WINDOW}]))" | jq -c "$to_map" 2>/dev/null || echo '{}')"
+PRESENT_WR="$(mon_post "count by (namespace, name) (rate(kubevirt_vmi_storage_write_traffic_bytes_total[${WINDOW}]))" | jq -c "$to_map" 2>/dev/null || echo '{}')"
+
 RX_MAP="$(mon_post "sum by (namespace, name) (rate(kubevirt_vmi_network_receive_bytes_total[${WINDOW}]))" | jq -c "$to_map" 2>/dev/null || echo '{}')"
 TX_MAP="$(mon_post "sum by (namespace, name) (rate(kubevirt_vmi_network_transmit_bytes_total[${WINDOW}]))" | jq -c "$to_map" 2>/dev/null || echo '{}')"
 RD_MAP="$(mon_post "sum by (namespace, name) (rate(kubevirt_vmi_storage_read_traffic_bytes_total[${WINDOW}]))" | jq -c "$to_map" 2>/dev/null || echo '{}')"
@@ -272,9 +285,7 @@ VMI_JSON="$(oc get "${VMI_RES}" -A -o json)"
 
 echo "Monitoring: svc/${PF_SVC} via https://127.0.0.1:${PF_PORT}"
 echo "Mode=${MODE} Window=${WINDOW} TopCandidates=${TOP_N}"
-if [[ "$MODE" == "wedge" ]]; then
-  echo "Filters: CPU>=${CPU_MIN_PCT}% net<=${NET_MAX_BPS} disk<=${DISK_MAX_BPS} steady=${STEADY} steady-only=${STEADY_ONLY} jitter<=${JITTER_MAX_PCT}% peak-avg<=${PEAKAVG_MAX_PCT}% iowait>=${IOWAIT_MIN_CORES} delay>=${DELAY_MIN_CORES}"
-fi
+echo "Filters: CPU>=${CPU_MIN_PCT}% net<=${NET_MAX_BPS} disk<=${DISK_MAX_BPS} steady=${STEADY} steady-only=${STEADY_ONLY} jitter<=${JITTER_MAX_PCT}% peak-avg<=${PEAKAVG_MAX_PCT}% iowait>=${IOWAIT_MIN_CORES} delay>=${DELAY_MIN_CORES} require-io-metrics=${REQUIRE_IO_METRICS}"
 echo
 
 HEADER=$'SCORE\tNODE\tNAMESPACE\tVMI\tVM(owner)\tvCPU\tAVG_CPU(%)\tAVG_CPU(cores)\tMAX_CPU(%)\tJITTER(%)\tPEAK-AVG(%)\tIOWAIT(cores)\tDELAY(cores)\tNET(B/s)\tDISK(B/s)'
@@ -285,6 +296,7 @@ jq -r \
   --argjson cpuMax "$CPU_MAX_MAP" \
   --argjson cpuStd "$CPU_STD_MAP" \
   --argjson rx "$RX_MAP" --argjson tx "$TX_MAP" --argjson rd "$RD_MAP" --argjson wr "$WR_MAP" \
+  --argjson prx "$PRESENT_RX" --argjson ptx "$PRESENT_TX" --argjson prd "$PRESENT_RD" --argjson pwr "$PRESENT_WR" \
   --argjson iow "$IOW_MAP" --argjson dly "$DLY_MAP" \
   --arg mode "$MODE" \
   --arg cpuMin "$CPU_MIN_PCT" \
@@ -296,6 +308,7 @@ jq -r \
   --arg peakavgMax "$PEAKAVG_MAX_PCT" \
   --arg iowMin "$IOWAIT_MIN_CORES" \
   --arg dlyMin "$DELAY_MIN_CORES" \
+  --arg requireIo "$REQUIRE_IO_METRICS" \
   --arg limit "$LIMIT" '
   def vcpu_count(v):
     ((v.spec.domain.cpu.cores // 1) *
@@ -309,10 +322,6 @@ jq -r \
   def clamp01(x): if x < 0 then 0 elif x > 1 then 1 else x end;
 
   # Option A score: 0..100
-  #  - CPU contributes 0..60 (avg CPU% / 100 * 60)
-  #  - quiet net contributes 0..15
-  #  - quiet disk contributes 0..15
-  #  - steady contributes 0..10 (5 jitter + 5 peakavg)
   def score100(avgPct; net; disk; jitter; peakavg; netThr; diskThr; jitThr; peakThr):
     (60 * clamp01((avgPct|tonumber) / 100))
     + (15 * clamp01(((netThr|tonumber) - (net|tonumber)) / (netThr|tonumber)))
@@ -339,8 +348,23 @@ jq -r \
     | (if $avgC <= 0 then 0 else (100 * ($stdC / $avgC)) end) as $jitterPct
     | (($maxPct - $avgPct)) as $peakavgPct
 
-    | (($rx[$k] // 0) + ($tx[$k] // 0)) as $netBps
-    | (($rd[$k] // 0) + ($wr[$k] // 0)) as $diskBps
+    # Detect whether we have evidence of IO series
+    | ((($prx[$k] // null) != null) or (($ptx[$k] // null) != null)) as $hasNetSeries
+    | ((($prd[$k] // null) != null) or (($pwr[$k] // null) != null)) as $hasDiskSeries
+    | ($hasNetSeries or $hasDiskSeries) as $hasAnyIo
+
+    # Use null for missing; only coerce to 0 if not requiring metrics (for display/compat)
+    | (if $hasNetSeries then (($rx[$k] // 0) + ($tx[$k] // 0)) else null end) as $netBpsN
+    | (if $hasDiskSeries then (($rd[$k] // 0) + ($wr[$k] // 0)) else null end) as $diskBpsN
+
+    | (if ($requireIo|tonumber) == 1 then
+         select($hasAnyIo)
+       else .
+       end)
+
+    | (if $netBpsN == null then 0 else $netBpsN end) as $netBps
+    | (if $diskBpsN == null then 0 else $diskBpsN end) as $diskBps
+
     | (($iow[$k] // 0)|tonumber) as $iowC
     | (($dly[$k] // 0)|tonumber) as $dlyC
 
