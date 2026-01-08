@@ -9,8 +9,10 @@ DEFAULT_WINDOW="10m"
 DEFAULT_TOP_N=200
 
 DEFAULT_CPU_MIN_PCT=80
-DEFAULT_NET_MAX_BPS=20000
-DEFAULT_DISK_MAX_BPS=20000
+
+# Option A (strict defaults)
+DEFAULT_NET_MAX_BPS=5000
+DEFAULT_DISK_MAX_BPS=15000
 
 DEFAULT_IOWAIT_MIN_CORES=0
 DEFAULT_DELAY_MIN_CORES=0
@@ -52,54 +54,68 @@ LIMIT="$DEFAULT_LIMIT"
 DEBUG=0
 INSPECT_NS=""
 INSPECT_VMI=""
+
+# Quiet selector flags:
+# With your change request, quiet defaults to NET AND DISK.
 QUIET_NET_ONLY=0
 QUIET_DISK_ONLY=0
+
 SUGGEST_QUIET=0
 SUGGEST_PCT="$DEFAULT_SUGGEST_PCT"
+QUIET_SUGGESTED=0
 
 # Track whether user explicitly set cpu-min
 CPU_MIN_EXPLICIT=0
+# Track whether user explicitly set net/disk thresholds (so quiet-suggested can override only if desired)
+NET_MAX_EXPLICIT=0
+DISK_MAX_EXPLICIT=0
 
 W_NODE="$DEFAULT_W_NODE"
 W_NS="$DEFAULT_W_NS"
 W_VMI="$DEFAULT_W_VMI"
 W_VM="$DEFAULT_W_VM"
 
+script_name() {
+  # show how the user invoked it, otherwise default
+  basename "${0:-vmcheck.sh}"
+}
+
 usage() {
-  cat <<'EOF'
-vmcheck.sh
+  local me
+  me="$(script_name)"
+  cat <<EOF
+${me}
 
 USAGE:
-  ./vmcheck.sh [options]
-  ./vmcheck.sh help
-  ./vmcheck.sh -h|--help
+  ./${me} [options]
+  ./${me} help
+  ./${me} -h|--help
 
 MODES:
   --mode wedge   (default)  CPU>=cpu-min AND NET<=net-max AND DISK<=disk-max (+ steady if enabled)
-  --mode quiet             Quiet by IO; default selector is (NET quiet) OR (DISK quiet)
+  --mode quiet             Quiet by IO (default selector is NET quiet AND DISK quiet)
   --mode top               Top N by CPU; no wedge/quiet filters
 
-QUIET MODE NOTE (change #3):
+QUIET MODE NOTE:
   If you run --mode quiet and you do NOT explicitly set --cpu-min,
   CPU filtering is disabled (treated as --cpu-min 0).
 
 QUIET SELECTOR FLAGS (only affect --mode quiet):
-  --quiet-net-only         quiet if NET<=net-max
-  --quiet-disk-only        quiet if DISK<=disk-max
-  (If both are set: quiet requires NET quiet AND DISK quiet)
-  (If neither: NET quiet OR DISK quiet)
+  --quiet-net-only         quiet if NET<=net-max (disk ignored)
+  --quiet-disk-only        quiet if DISK<=disk-max (net ignored)
+  (If neither flag is set: quiet requires NET quiet AND DISK quiet)
 
 THRESHOLDS:
-  --window <dur>           default 10m
-  --top <N>                default 200
+  --window <dur>           default ${DEFAULT_WINDOW}
+  --top <N>                default ${DEFAULT_TOP_N}
   --limit <N>              default 0 (unlimited)
-  --cpu-min <pct>          default 80 (quiet mode default becomes 0 if not set)
-  --net-max <bps>          default 20000
-  --disk-max <bps>         default 20000
-  --jitter-max <pct>       default 3
-  --peakavg-max <pct>      default 3
-  --iowait-min <cores>     default 0
-  --delay-min <cores>      default 0
+  --cpu-min <pct>          default ${DEFAULT_CPU_MIN_PCT} (quiet mode becomes 0 if not set)
+  --net-max <bps>          default ${DEFAULT_NET_MAX_BPS}
+  --disk-max <bps>         default ${DEFAULT_DISK_MAX_BPS}
+  --jitter-max <pct>       default ${DEFAULT_JITTER_MAX_PCT}
+  --peakavg-max <pct>      default ${DEFAULT_PEAKAVG_MAX_PCT}
+  --iowait-min <cores>     default ${DEFAULT_IOWAIT_MIN_CORES}
+  --delay-min <cores>      default ${DEFAULT_DELAY_MIN_CORES}
 
 STEADY:
   --steady / --no-steady
@@ -109,14 +125,15 @@ METRIC PRESENCE:
   --require-io-metrics / --no-require-io-metrics
 
 DISPLAY:
-  --w-node <N>             truncate NODE to N chars (default 18)
-  --w-ns <N>               truncate NS to N chars (default 18)
-  --w-vmi <N>              truncate VMI to N chars (default 28)
-  --w-vm <N>               truncate VM to N chars (default 28)
+  --w-node <N>             truncate NODE to N chars (default ${DEFAULT_W_NODE})
+  --w-ns <N>               truncate NS to N chars (default ${DEFAULT_W_NS})
+  --w-vmi <N>              truncate VMI to N chars (default ${DEFAULT_W_VMI})
+  --w-vm <N>               truncate VM to N chars (default ${DEFAULT_W_VM})
 
-HELPERS (change #1 + #2):
-  --suggest-quiet           suggest IO quiet thresholds using LOW percentile (default p20) of candidate set
-  --suggest-pct <N>         percentile for suggest-quiet (1..99), default 20
+HELPERS:
+  --suggest-quiet           suggest IO quiet thresholds using LOW percentile (default p${DEFAULT_SUGGEST_PCT}) of candidate set
+  --suggest-pct <N>         percentile for suggest-quiet (1..99), default ${DEFAULT_SUGGEST_PCT}
+  --quiet-suggested         (quiet mode) auto-compute thresholds (as in --suggest-quiet) and use them for THIS run
 
 INSPECT:
   --inspect <namespace> <vmi>
@@ -125,10 +142,12 @@ DEBUG:
   --debug
 
 EXAMPLES:
-  ./vmcheck.sh --mode quiet
-  ./vmcheck.sh --mode quiet --net-max 5000 --quiet-net-only
-  ./vmcheck.sh --suggest-quiet
-  ./vmcheck.sh --suggest-quiet --suggest-pct 15
+  ./${me} --mode quiet
+  ./${me} --mode quiet --quiet-suggested --limit 50
+  ./${me} --mode quiet --net-max 5000 --disk-max 15000
+  ./${me} --mode quiet --quiet-net-only --net-max 1000
+  ./${me} --suggest-quiet
+  ./${me} --suggest-quiet --suggest-pct 15
 EOF
 }
 
@@ -141,8 +160,8 @@ while [[ $# -gt 0 ]]; do
     --top) TOP_N="$2"; shift 2;;
     --limit) LIMIT="$2"; shift 2;;
     --cpu-min) CPU_MIN_PCT="$2"; CPU_MIN_EXPLICIT=1; shift 2;;
-    --net-max) NET_MAX_BPS="$2"; shift 2;;
-    --disk-max) DISK_MAX_BPS="$2"; shift 2;;
+    --net-max) NET_MAX_BPS="$2"; NET_MAX_EXPLICIT=1; shift 2;;
+    --disk-max) DISK_MAX_BPS="$2"; DISK_MAX_EXPLICIT=1; shift 2;;
     --iowait-min) IOWAIT_MIN_CORES="$2"; shift 2;;
     --delay-min) DELAY_MIN_CORES="$2"; shift 2;;
     --steady) STEADY=1; shift 1;;
@@ -153,11 +172,15 @@ while [[ $# -gt 0 ]]; do
     --no-steady-only) STEADY_ONLY=0; shift 1;;
     --require-io-metrics) REQUIRE_IO_METRICS=1; shift 1;;
     --no-require-io-metrics) REQUIRE_IO_METRICS=0; shift 1;;
+
     --quiet-net-only) QUIET_NET_ONLY=1; shift 1;;
     --quiet-disk-only) QUIET_DISK_ONLY=1; shift 1;;
+
     --inspect) INSPECT_NS="$2"; INSPECT_VMI="$3"; shift 3;;
+
     --suggest-quiet) SUGGEST_QUIET=1; shift 1;;
     --suggest-pct) SUGGEST_PCT="$2"; shift 2;;
+    --quiet-suggested) QUIET_SUGGESTED=1; shift 1;;
 
     --w-node) W_NODE="$2"; shift 2;;
     --w-ns) W_NS="$2"; shift 2;;
@@ -170,13 +193,13 @@ while [[ $# -gt 0 ]]; do
   esac
 done
 
-# change #3: quiet mode defaults cpu-min to 0 unless explicitly set
+# Quiet mode: default cpu-min to 0 unless explicitly set
 if [[ "$MODE" == "quiet" && "$CPU_MIN_EXPLICIT" -eq 0 ]]; then
   CPU_MIN_PCT=0
 fi
 
 # validate suggest pct
-if [[ "$SUGGEST_QUIET" -eq 1 ]]; then
+if [[ "$SUGGEST_QUIET" -eq 1 || "$QUIET_SUGGESTED" -eq 1 ]]; then
   if ! [[ "$SUGGEST_PCT" =~ ^[0-9]+$ ]] || [[ "$SUGGEST_PCT" -lt 1 || "$SUGGEST_PCT" -gt 99 ]]; then
     echo "ERROR: --suggest-pct must be an integer 1..99" >&2
     exit 2
@@ -356,13 +379,18 @@ TX_MAP="$(mon_post "sum by (namespace, name) (rate(kubevirt_vmi_network_transmit
 RD_MAP="$(mon_post "sum by (namespace, name) (rate(kubevirt_vmi_storage_read_traffic_bytes_total[${WINDOW}]))" | jq -c "$to_map" 2>/dev/null || echo '{}')"
 WR_MAP="$(mon_post "sum by (namespace, name) (rate(kubevirt_vmi_storage_write_traffic_bytes_total[${WINDOW}]))" | jq -c "$to_map" 2>/dev/null || echo '{}')"
 
+VMI_JSON="$(oc get "${VMI_RES}" -A -o json)"
+
 # -----------------------------
-# change #1 + #2: suggest quiet thresholds using LOW percentile of candidates
+# Suggest quiet thresholds helper (low percentile over candidate set)
 # -----------------------------
-if [[ "$SUGGEST_QUIET" -eq 1 ]]; then
-  # Collect NET/DISK for candidate set (top CPU)
-  DATA_TSV="$(
-    oc get "${VMI_RES}" -A -o json | jq -r \
+suggest_quiet_thresholds() {
+  local pct="$1"
+
+  local data_tsv net_ser disk_ser net_p disk_p
+
+  data_tsv="$(
+    jq -r \
       --argjson avgCpu "$WANTED_AVG_CPU_MAP" \
       --argjson rx "$RX_MAP" --argjson tx "$TX_MAP" --argjson rd "$RD_MAP" --argjson wr "$WR_MAP" \
       --argjson prx "$PRESENT_RX" --argjson ptx "$PRESENT_TX" --argjson prd "$PRESENT_RD" --argjson pwr "$PRESENT_WR" '
@@ -377,23 +405,20 @@ if [[ "$SUGGEST_QUIET" -eq 1 ]]; then
       | (if $hasDisk then (($rd[$k] // 0) + ($wr[$k] // 0)) else 0 end) as $disk
 
       | [$net, $disk] | @tsv
-    '
+    ' <<<"$VMI_JSON"
   )"
 
-  if [[ -z "$DATA_TSV" ]]; then
-    echo "No candidate data to suggest from."
-    exit 0
+  if [[ -z "$data_tsv" ]]; then
+    echo "0 0"
+    return 0
   fi
 
-  # Suggest using LOW percentile (e.g., p20) of the candidate set.
-  # Also ignore zeros when there are enough non-zero samples, so we don't suggest 0.
   suggest_pct() {
     local pct="$1"
     awk -v P="$pct" '
       { a[NR]=$1 }
       END {
         if (NR==0) { print 0; exit }
-        # sort ascending
         for (i=1;i<=NR;i++) for (j=i+1;j<=NR;j++) if (a[i]>a[j]) { t=a[i]; a[i]=a[j]; a[j]=t }
         idx=int(NR*(P/100.0)); if (idx<1) idx=1; if (idx>NR) idx=NR;
         printf "%.0f\n", a[idx]
@@ -401,42 +426,56 @@ if [[ "$SUGGEST_QUIET" -eq 1 ]]; then
     '
   }
 
-  # try percentile on non-zero samples first (if enough)
-  nonzero_or_all() {
-    awk '($1>0){print $1}' | awk 'END{exit (NR>=20)?0:1}' >/dev/null 2>&1
-  }
+  net_ser="$(printf "%s\n" "$data_tsv" | awk '{print $1}')"
+  disk_ser="$(printf "%s\n" "$data_tsv" | awk '{print $2}')"
 
-  NET_SER="$(printf "%s\n" "$DATA_TSV" | awk '{print $1}')"
-  DISK_SER="$(printf "%s\n" "$DATA_TSV" | awk '{print $2}')"
-
-  if printf "%s\n" "$NET_SER" | awk '($1>0){c++} END{exit !(c>=20)}' >/dev/null 2>&1; then
-    NET_P="$(printf "%s\n" "$NET_SER" | awk '($1>0){print $1}' | suggest_pct "$SUGGEST_PCT")"
+  # Prefer non-zero samples if enough exist (avoid suggesting 0)
+  if printf "%s\n" "$net_ser" | awk '($1>0){c++} END{exit !(c>=20)}' >/dev/null 2>&1; then
+    net_p="$(printf "%s\n" "$net_ser" | awk '($1>0){print $1}' | suggest_pct "$pct")"
   else
-    NET_P="$(printf "%s\n" "$NET_SER" | suggest_pct "$SUGGEST_PCT")"
+    net_p="$(printf "%s\n" "$net_ser" | suggest_pct "$pct")"
   fi
 
-  if printf "%s\n" "$DISK_SER" | awk '($1>0){c++} END{exit !(c>=20)}' >/dev/null 2>&1; then
-    DISK_P="$(printf "%s\n" "$DISK_SER" | awk '($1>0){print $1}' | suggest_pct "$SUGGEST_PCT")"
+  if printf "%s\n" "$disk_ser" | awk '($1>0){c++} END{exit !(c>=20)}' >/dev/null 2>&1; then
+    disk_p="$(printf "%s\n" "$disk_ser" | awk '($1>0){print $1}' | suggest_pct "$pct")"
   else
-    DISK_P="$(printf "%s\n" "$DISK_SER" | suggest_pct "$SUGGEST_PCT")"
+    disk_p="$(printf "%s\n" "$disk_ser" | suggest_pct "$pct")"
   fi
 
-  # guardrail: never suggest < 100 unless truly tiny
-  if [[ "$NET_P" -lt 100 ]]; then NET_P=100; fi
-  if [[ "$DISK_P" -lt 100 ]]; then DISK_P=100; fi
+  # guardrails
+  if [[ "$net_p" -lt 100 ]]; then net_p=100; fi
+  if [[ "$disk_p" -lt 100 ]]; then disk_p=100; fi
 
+  echo "${net_p} ${disk_p}"
+}
+
+# --suggest-quiet standalone output
+if [[ "$SUGGEST_QUIET" -eq 1 ]]; then
+  read -r NET_P DISK_P < <(suggest_quiet_thresholds "$SUGGEST_PCT")
   echo "Suggested quiet thresholds from top-candidates over WINDOW=${WINDOW} using p${SUGGEST_PCT} (low tail):"
   echo "  --net-max  ${NET_P}"
   echo "  --disk-max ${DISK_P}"
   echo
   echo "Try:"
-  echo "  ./vmcheck.sh --mode quiet --cpu-min 0 --net-max ${NET_P} --disk-max ${DISK_P} --limit 50"
+  echo "  ./$(script_name) --mode quiet --cpu-min 0 --net-max ${NET_P} --disk-max ${DISK_P} --limit 50"
   exit 0
 fi
 
-VMI_JSON="$(oc get "${VMI_RES}" -A -o json)"
+# --quiet-suggested (quiet mode) => override thresholds for this run unless user explicitly set them
+if [[ "$QUIET_SUGGESTED" -eq 1 ]]; then
+  if [[ "$MODE" != "quiet" ]]; then
+    echo "ERROR: --quiet-suggested is intended for --mode quiet" >&2
+    exit 2
+  fi
+  read -r NET_P DISK_P < <(suggest_quiet_thresholds "$SUGGEST_PCT")
+  [[ "$DEBUG" -eq 1 ]] && echo "DEBUG: quiet-suggested thresholds: net-max=${NET_P} disk-max=${DISK_P}" >&2
 
-QUIET_DESC="net OR disk"
+  if [[ "$NET_MAX_EXPLICIT" -eq 0 ]]; then NET_MAX_BPS="$NET_P"; fi
+  if [[ "$DISK_MAX_EXPLICIT" -eq 0 ]]; then DISK_MAX_BPS="$DISK_P"; fi
+fi
+
+# Quiet selector description (now AND by default)
+QUIET_DESC="net AND disk"
 if [[ "$QUIET_NET_ONLY" -eq 1 && "$QUIET_DISK_ONLY" -eq 0 ]]; then QUIET_DESC="net only"; fi
 if [[ "$QUIET_NET_ONLY" -eq 0 && "$QUIET_DISK_ONLY" -eq 1 ]]; then QUIET_DESC="disk only"; fi
 if [[ "$QUIET_NET_ONLY" -eq 1 && "$QUIET_DISK_ONLY" -eq 1 ]]; then QUIET_DESC="net AND disk"; fi
@@ -447,7 +486,7 @@ echo "Thresholds: cpu-min=${CPU_MIN_PCT}% net-max=${NET_MAX_BPS} disk-max=${DISK
 echo "Flags: steady=${STEADY} steady-only=${STEADY_ONLY} require-io-metrics=${REQUIRE_IO_METRICS} quiet-selector=${QUIET_DESC}"
 echo
 
-# Header + rows columnized together
+# Header + rows
 {
   echo -e "SCORE\tS_CPU\tS_NET\tS_DSK\tS_STD\tNODE\tNS\tVMI\tVM\tvCPU\tCPU_AVG%\tCPU_AVG\tCPU_MAX%\tJIT%\tPKAVG%\tIOW\tDLY\tNET_BPS\tDSK_BPS"
 
@@ -490,17 +529,17 @@ echo
         else ($s[0:($n-1)] + "…")
         end;
 
-    # scoring components (0..100 total max)
     def cpuS(avgPct): 60 * clamp01((avgPct|tonumber)/100);
-    def netS(net; thr): 15 * clamp01(((thr|tonumber) - (net|tonumber)) / (thr|tonumber));
-    def diskS(disk; thr): 15 * clamp01(((thr|tonumber) - (disk|tonumber)) / (thr|tonumber));
+    def netS(net; thr): 15 * (if (thr|tonumber) <= 0 then 0 else clamp01(((thr|tonumber) - (net|tonumber)) / (thr|tonumber)) end);
+    def diskS(disk; thr): 15 * (if (thr|tonumber) <= 0 then 0 else clamp01(((thr|tonumber) - (disk|tonumber)) / (thr|tonumber)) end);
     def steadyS(jitter; peakavg; jitThr; peakThr):
-      (5 * clamp01(((jitThr|tonumber) - (jitter|tonumber)) / (jitThr|tonumber)))
-      + (5 * clamp01(((peakThr|tonumber) - (peakavg|tonumber)) / (peakThr|tonumber)));
+      (5 * (if (jitThr|tonumber) <= 0 then 0 else clamp01(((jitThr|tonumber) - (jitter|tonumber)) / (jitThr|tonumber)) end))
+      + (5 * (if (peakThr|tonumber) <= 0 then 0 else clamp01(((peakThr|tonumber) - (peakavg|tonumber)) / (peakThr|tonumber)) end));
 
     def totalScore(avgPct; net; disk; jitter; peakavg; netThr; diskThr; jitThr; peakThr):
       cpuS(avgPct) + netS(net; netThr) + diskS(disk; diskThr) + steadyS(jitter; peakavg; jitThr; peakThr);
 
+    # Quiet match: AND by default; flags allow only net or only disk
     def quietMatch(net; disk; netThr; diskThr; qNetOnly; qDiskOnly):
       (if (qNetOnly|tonumber)==1 and (qDiskOnly|tonumber)==1 then
           ((net|tonumber) <= (netThr|tonumber)) and ((disk|tonumber) <= (diskThr|tonumber))
@@ -509,7 +548,7 @@ echo
        elif (qDiskOnly|tonumber)==1 then
           ((disk|tonumber) <= (diskThr|tonumber))
        else
-          ((net|tonumber) <= (netThr|tonumber)) or ((disk|tonumber) <= (diskThr|tonumber))
+          ((net|tonumber) <= (netThr|tonumber)) and ((disk|tonumber) <= (diskThr|tonumber))
        end);
 
     [
