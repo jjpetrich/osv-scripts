@@ -29,6 +29,9 @@ DEFAULT_W_NS=18
 DEFAULT_W_VMI=28
 DEFAULT_W_VM=28
 
+# suggest-quiet percentile (LOW tail)
+DEFAULT_SUGGEST_PCT=20
+
 # -----------------------------
 # Parsed args -> variables
 # -----------------------------
@@ -52,6 +55,10 @@ INSPECT_VMI=""
 QUIET_NET_ONLY=0
 QUIET_DISK_ONLY=0
 SUGGEST_QUIET=0
+SUGGEST_PCT="$DEFAULT_SUGGEST_PCT"
+
+# Track whether user explicitly set cpu-min
+CPU_MIN_EXPLICIT=0
 
 W_NODE="$DEFAULT_W_NODE"
 W_NS="$DEFAULT_W_NS"
@@ -72,6 +79,10 @@ MODES:
   --mode quiet             Quiet by IO; default selector is (NET quiet) OR (DISK quiet)
   --mode top               Top N by CPU; no wedge/quiet filters
 
+QUIET MODE NOTE (change #3):
+  If you run --mode quiet and you do NOT explicitly set --cpu-min,
+  CPU filtering is disabled (treated as --cpu-min 0).
+
 QUIET SELECTOR FLAGS (only affect --mode quiet):
   --quiet-net-only         quiet if NET<=net-max
   --quiet-disk-only        quiet if DISK<=disk-max
@@ -82,7 +93,7 @@ THRESHOLDS:
   --window <dur>           default 10m
   --top <N>                default 200
   --limit <N>              default 0 (unlimited)
-  --cpu-min <pct>          default 80 (quiet mode: set 0 to ignore CPU)
+  --cpu-min <pct>          default 80 (quiet mode default becomes 0 if not set)
   --net-max <bps>          default 20000
   --disk-max <bps>         default 20000
   --jitter-max <pct>       default 3
@@ -103,8 +114,9 @@ DISPLAY:
   --w-vmi <N>              truncate VMI to N chars (default 28)
   --w-vm <N>               truncate VM to N chars (default 28)
 
-HELPERS:
-  --suggest-quiet           print suggested --net-max / --disk-max based on current data then exit
+HELPERS (change #1 + #2):
+  --suggest-quiet           suggest IO quiet thresholds using LOW percentile (default p20) of candidate set
+  --suggest-pct <N>         percentile for suggest-quiet (1..99), default 20
 
 INSPECT:
   --inspect <namespace> <vmi>
@@ -114,8 +126,9 @@ DEBUG:
 
 EXAMPLES:
   ./likely-bsod-vms.sh --mode quiet
-  ./likely-bsod-vms.sh --mode quiet --cpu-min 0 --quiet-net-only
+  ./likely-bsod-vms.sh --mode quiet --net-max 5000 --quiet-net-only
   ./likely-bsod-vms.sh --suggest-quiet
+  ./likely-bsod-vms.sh --suggest-quiet --suggest-pct 15
 EOF
 }
 
@@ -127,7 +140,7 @@ while [[ $# -gt 0 ]]; do
     --window) WINDOW="$2"; shift 2;;
     --top) TOP_N="$2"; shift 2;;
     --limit) LIMIT="$2"; shift 2;;
-    --cpu-min) CPU_MIN_PCT="$2"; shift 2;;
+    --cpu-min) CPU_MIN_PCT="$2"; CPU_MIN_EXPLICIT=1; shift 2;;
     --net-max) NET_MAX_BPS="$2"; shift 2;;
     --disk-max) DISK_MAX_BPS="$2"; shift 2;;
     --iowait-min) IOWAIT_MIN_CORES="$2"; shift 2;;
@@ -144,6 +157,7 @@ while [[ $# -gt 0 ]]; do
     --quiet-disk-only) QUIET_DISK_ONLY=1; shift 1;;
     --inspect) INSPECT_NS="$2"; INSPECT_VMI="$3"; shift 3;;
     --suggest-quiet) SUGGEST_QUIET=1; shift 1;;
+    --suggest-pct) SUGGEST_PCT="$2"; shift 2;;
 
     --w-node) W_NODE="$2"; shift 2;;
     --w-ns) W_NS="$2"; shift 2;;
@@ -155,6 +169,19 @@ while [[ $# -gt 0 ]]; do
     *) echo "Unknown arg: $1" >&2; usage; exit 2;;
   esac
 done
+
+# change #3: quiet mode defaults cpu-min to 0 unless explicitly set
+if [[ "$MODE" == "quiet" && "$CPU_MIN_EXPLICIT" -eq 0 ]]; then
+  CPU_MIN_PCT=0
+fi
+
+# validate suggest pct
+if [[ "$SUGGEST_QUIET" -eq 1 ]]; then
+  if ! [[ "$SUGGEST_PCT" =~ ^[0-9]+$ ]] || [[ "$SUGGEST_PCT" -lt 1 || "$SUGGEST_PCT" -gt 99 ]]; then
+    echo "ERROR: --suggest-pct must be an integer 1..99" >&2
+    exit 2
+  fi
+fi
 
 need() { command -v "$1" >/dev/null 2>&1 || { echo "Missing dependency: $1" >&2; exit 1; }; }
 need oc; need jq; need curl
@@ -329,9 +356,11 @@ TX_MAP="$(mon_post "sum by (namespace, name) (rate(kubevirt_vmi_network_transmit
 RD_MAP="$(mon_post "sum by (namespace, name) (rate(kubevirt_vmi_storage_read_traffic_bytes_total[${WINDOW}]))" | jq -c "$to_map" 2>/dev/null || echo '{}')"
 WR_MAP="$(mon_post "sum by (namespace, name) (rate(kubevirt_vmi_storage_write_traffic_bytes_total[${WINDOW}]))" | jq -c "$to_map" 2>/dev/null || echo '{}')"
 
-# Suggest-quiet helper (based on current candidate set)
+# -----------------------------
+# change #1 + #2: suggest quiet thresholds using LOW percentile of candidates
+# -----------------------------
 if [[ "$SUGGEST_QUIET" -eq 1 ]]; then
-  # build a quick list of net/disk bps for the candidate set, then take p95
+  # Collect NET/DISK for candidate set (top CPU)
   DATA_TSV="$(
     oc get "${VMI_RES}" -A -o json | jq -r \
       --argjson avgCpu "$WANTED_AVG_CPU_MAP" \
@@ -340,12 +369,15 @@ if [[ "$SUGGEST_QUIET" -eq 1 ]]; then
       .items[]
       | (.metadata.namespace + "/" + .metadata.name) as $k
       | select(($avgCpu[$k] // null) != null)
+
       | ((($prx[$k] // null) != null) or (($ptx[$k] // null) != null)) as $hasNet
       | ((($prd[$k] // null) != null) or (($pwr[$k] // null) != null)) as $hasDisk
+
       | (if $hasNet then (($rx[$k] // 0) + ($tx[$k] // 0)) else 0 end) as $net
       | (if $hasDisk then (($rd[$k] // 0) + ($wr[$k] // 0)) else 0 end) as $disk
+
       | [$net, $disk] | @tsv
-    ' | head -n 20000
+    '
   )"
 
   if [[ -z "$DATA_TSV" ]]; then
@@ -353,29 +385,52 @@ if [[ "$SUGGEST_QUIET" -eq 1 ]]; then
     exit 0
   fi
 
-  # compute p95 with awk (simple, fast)
-  suggest_p95() {
-    awk '
+  # Suggest using LOW percentile (e.g., p20) of the candidate set.
+  # Also ignore zeros when there are enough non-zero samples, so we don't suggest 0.
+  suggest_pct() {
+    local pct="$1"
+    awk -v P="$pct" '
       { a[NR]=$1 }
       END {
         if (NR==0) { print 0; exit }
-        # sort
+        # sort ascending
         for (i=1;i<=NR;i++) for (j=i+1;j<=NR;j++) if (a[i]>a[j]) { t=a[i]; a[i]=a[j]; a[j]=t }
-        idx=int(NR*0.95); if (idx<1) idx=1; if (idx>NR) idx=NR;
+        idx=int(NR*(P/100.0)); if (idx<1) idx=1; if (idx>NR) idx=NR;
         printf "%.0f\n", a[idx]
       }
     '
   }
 
-  NET_P95="$(printf "%s\n" "$DATA_TSV" | awk '{print $1}' | suggest_p95)"
-  DISK_P95="$(printf "%s\n" "$DATA_TSV" | awk '{print $2}' | suggest_p95)"
+  # try percentile on non-zero samples first (if enough)
+  nonzero_or_all() {
+    awk '($1>0){print $1}' | awk 'END{exit (NR>=20)?0:1}' >/dev/null 2>&1
+  }
 
-  echo "Suggested quiet thresholds from top-candidates over WINDOW=${WINDOW}:"
-  echo "  --net-max  ${NET_P95}"
-  echo "  --disk-max ${DISK_P95}"
+  NET_SER="$(printf "%s\n" "$DATA_TSV" | awk '{print $1}')"
+  DISK_SER="$(printf "%s\n" "$DATA_TSV" | awk '{print $2}')"
+
+  if printf "%s\n" "$NET_SER" | awk '($1>0){c++} END{exit !(c>=20)}' >/dev/null 2>&1; then
+    NET_P="$(printf "%s\n" "$NET_SER" | awk '($1>0){print $1}' | suggest_pct "$SUGGEST_PCT")"
+  else
+    NET_P="$(printf "%s\n" "$NET_SER" | suggest_pct "$SUGGEST_PCT")"
+  fi
+
+  if printf "%s\n" "$DISK_SER" | awk '($1>0){c++} END{exit !(c>=20)}' >/dev/null 2>&1; then
+    DISK_P="$(printf "%s\n" "$DISK_SER" | awk '($1>0){print $1}' | suggest_pct "$SUGGEST_PCT")"
+  else
+    DISK_P="$(printf "%s\n" "$DISK_SER" | suggest_pct "$SUGGEST_PCT")"
+  fi
+
+  # guardrail: never suggest < 100 unless truly tiny
+  if [[ "$NET_P" -lt 100 ]]; then NET_P=100; fi
+  if [[ "$DISK_P" -lt 100 ]]; then DISK_P=100; fi
+
+  echo "Suggested quiet thresholds from top-candidates over WINDOW=${WINDOW} using p${SUGGEST_PCT} (low tail):"
+  echo "  --net-max  ${NET_P}"
+  echo "  --disk-max ${DISK_P}"
   echo
   echo "Try:"
-  echo "  ./likely-bsod-vms.sh --mode quiet --cpu-min 0 --net-max ${NET_P95} --disk-max ${DISK_P95} --limit 50"
+  echo "  ./likely-bsod-vms.sh --mode quiet --cpu-min 0 --net-max ${NET_P} --disk-max ${DISK_P} --limit 50"
   exit 0
 fi
 
@@ -392,7 +447,7 @@ echo "Thresholds: cpu-min=${CPU_MIN_PCT}% net-max=${NET_MAX_BPS} disk-max=${DISK
 echo "Flags: steady=${STEADY} steady-only=${STEADY_ONLY} require-io-metrics=${REQUIRE_IO_METRICS} quiet-selector=${QUIET_DESC}"
 echo
 
-# Header + rows are combined then columnized together (best alignment)
+# Header + rows columnized together
 {
   echo -e "SCORE\tS_CPU\tS_NET\tS_DSK\tS_STD\tNODE\tNS\tVMI\tVM\tvCPU\tCPU_AVG%\tCPU_AVG\tCPU_MAX%\tJIT%\tPKAVG%\tIOW\tDLY\tNET_BPS\tDSK_BPS"
 
