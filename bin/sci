@@ -692,7 +692,7 @@ if [[ $NODE_SCOPE_MAIN -eq 1 && -n "$NODE_FILTER" ]]; then
 fi
 
 # Build header line
-header="NODE                STATUS                    ROLES                     ALLOCGi   BOOKEDGi  BOOKED%"
+header="NODE                STATUS                       ROLES                     ALLOCGi   BOOKEDGi  BOOKED%"
 if [[ $HAS_USAGE -eq 1 ]]; then
   header="$header USAGEGi   USED%"
 fi
@@ -793,7 +793,7 @@ function colorpct(p,w,   col,s,pad){
         }
       }
 
-      line = sprintf("%-19s %-25s %-25s %-9.2f %-9.2f %-s",
+      line = sprintf("%-19s %-28s %-25s %-9.2f %-9.2f %-s",
                      node, status, role, aGi, bGi, bPctS);
 
       if (has_usage){
@@ -845,7 +845,7 @@ else
       cAlloc=$7+0; cBook=$8+0; cBookPct=$9+0;
       cores=$10+0; capGi=$11+0;
 
-      line = sprintf("%-19s %-25s %-25s %-9.2f %-9.2f %9d",
+      line = sprintf("%-19s %-28s %-25s %-9.2f %-9.2f %9d",
                      node, status, role, aGi, bGi, bPct);
 
       if (show_cpu){
