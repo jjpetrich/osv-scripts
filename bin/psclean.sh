@@ -1,42 +1,26 @@
 #!/usr/bin/env bash
-# psclean.sh - PowerStore/OpenShift reconciliation (patched)
-# Features:
-#  - robust login + retry (prevents --relogin race)
-#  - reads Content-Range for total count
-#  - --k8s-only to limit to PVC-named / CSI-metadata volumes
-#  - --protect-dv, --relogin, --preview N, --dr, --dc, --ns supported
+# psclean.sh - PowerStore/OpenShift reconciliation (patched with robust login + debug)
 #
-
+# New features:
+#  - PSTORE_LOGIN_RETRIES (default 10) and PSTORE_LOGIN_BACKOFF (default 2) for login attempts
+#  - PSTORE_LOGIN_POST_SLEEP (default 1s) to avoid relogin race
+#  - --debug flag prints short headers/body preview for PowerStore API calls
 #
-export PSTORE_IP=powerstore.byu.edu
-read -rp "PowerStore username: " PSTORE_USER
-read -s -rp "PowerStore password: " PSTORE_PASS; echo
-
-COOKIEFILE="$(mktemp)"
-HDRFILE="${COOKIEFILE}.hdr"
-
-curl -k -s -X GET \
-  -H "Accept: application/json" -H "Content-Type: application/json" \
-  -u "${PSTORE_USER}:${PSTORE_PASS}" -c "${COOKIEFILE}" \
-  "https://${PSTORE_IP}/api/rest/login_session" -D "${HDRFILE}"
-
-# extract token
-PSTORE_TOKEN="$(awk -F': ' '/DELL-EMC-TOKEN/ {print $2; exit}' "${HDRFILE}" | tr -d $'\r\n')"
-
-# quick check (optional)
-curl -k -s -H "DELL-EMC-TOKEN: ${PSTORE_TOKEN}" -b "${COOKIEFILE}" \
-  "https://${PSTORE_IP}/api/rest/volume?limit=1" -w "\nHTTP_STATUS:%{http_code}\n"
-
-# export for the script to use
-export PSTORE_COOKIEFILE="${COOKIEFILE}"
-export PSTORE_TOKEN="${PSTORE_TOKEN}"
-# keep PSTORE_USER/PSTORE_PASS unset if you don't want the script to re-login
-
+# Existing features:
+#  - session persistence (pstore_session/)
+#  - storage_reports/ CSV output
+#  - --dr, --dc, --ns, --protect-dv, --relogin, --k8s-only, --preview
+#
 set -euo pipefail
 
+# ---------- Defaults & env-configurable values ----------
 CSI_DRIVER="${CSI_DRIVER:-csi-powerstore.dellemc.com}"
 PSTORE_INSECURE="${PSTORE_INSECURE:-1}"
+PSTORE_LOGIN_RETRIES="${PSTORE_LOGIN_RETRIES:-10}"
+PSTORE_LOGIN_BACKOFF="${PSTORE_LOGIN_BACKOFF:-2}"       # initial backoff in seconds (exponential)
+PSTORE_LOGIN_POST_SLEEP="${PSTORE_LOGIN_POST_SLEEP:-1}" # sleep after login before validation (seconds)
 
+# ---------- CLI flags ----------
 DRY_RUN=0
 DELETE_COUNT=0
 NAMESPACE=""
@@ -44,14 +28,20 @@ PROTECT_DV=0
 FORCE_RELOGIN=0
 K8S_ONLY=0
 PREVIEW_N=0
+DEBUG=0
 
 usage(){ cat <<'USAGE'
 Usage: PSTORE_IP=... ./psclean.sh [--dr|--dry-run] [--dc N|--delete-count N] [--ns NS]
-                                 [--protect-dv] [--relogin] [--k8s-only] [--preview N]
+                                 [--protect-dv] [--relogin] [--k8s-only] [--preview N] [--debug]
 Flags:
   --k8s-only       Only consider volumes likely created by Kubernetes CSI (name pvc- or CSI metadata)
   --preview N      Print first N candidate volume IDs before any deletion
+  --debug          Print short debug info (headers + preview body) for PowerStore API calls
 Other flags as before.
+Environment vars:
+  PSTORE_LOGIN_RETRIES (default 10)
+  PSTORE_LOGIN_BACKOFF (default 2)
+  PSTORE_LOGIN_POST_SLEEP (default 1)
 USAGE
 }
 
@@ -67,16 +57,17 @@ while [[ $# -gt 0 ]]; do
     --relogin) FORCE_RELOGIN=1; shift ;;
     --k8s-only) K8S_ONLY=1; shift ;;
     --preview) [[ $# -ge 2 ]] || die "Missing value for $1"; PREVIEW_N="$2"; shift 2 ;;
+    --debug) DEBUG=1; shift ;;
     --help|-h) usage; exit 0 ;;
     *) die "Unknown arg: $1" ;;
   esac
 done
 
-[[ -n "${PSTORE_IP:-}" ]] || die "PSTORE_IP required"
+[[ -n "${PSTORE_IP:-}" ]] || die "PSTORE_IP required (PowerStore management IP/FQDN)"
 
 CURL_TLS=(); [[ "$PSTORE_INSECURE" == "1" ]] && CURL_TLS=(-k)
 
-# locations
+# file layout
 SCRIPT_PATH="$(readlink -f "${BASH_SOURCE[0]}")"
 SCRIPT_DIR="$(dirname "$SCRIPT_PATH")"
 SESSION_DIR="$SCRIPT_DIR/pstore_session"
@@ -99,14 +90,16 @@ echo "  Protect DV      : $PROTECT_DV"
 echo "  Force relogin   : $FORCE_RELOGIN"
 echo "  K8s-only filter : $K8S_ONLY"
 echo "  Preview N       : $PREVIEW_N"
+echo "  Debug mode      : $DEBUG"
 echo "  Report          : $REPORT"
+echo "  Session dir     : $SESSION_DIR"
 echo
 
 COOKIE_FILE_ON_DISK="$SESSION_DIR/cookie.file"
 TOKEN_FILE_ON_DISK="$SESSION_DIR/token.txt"
 
-# relogin
 if [[ "$FORCE_RELOGIN" == "1" ]]; then
+  echo "Forcing re-login: removing stored session if present..."
   rm -f "$COOKIE_FILE_ON_DISK" "$TOKEN_FILE_ON_DISK" || true
 fi
 
@@ -121,36 +114,55 @@ load_session_if_exists(){
   return 1
 }
 
-# robust login: attempt up to 5 times with backoff and validate by requesting a small page
+# robust login with retries, exponential backoff, and post-login sleep before validation
 _ps_login_and_store(){
-  # interactive prompt if missing
   if [[ -z "${PSTORE_USER:-}" ]]; then read -rp "PowerStore username: " PSTORE_USER; fi
   if [[ -z "${PSTORE_PASS:-}" ]]; then read -s -rp "PowerStore password for ${PSTORE_USER}: " PSTORE_PASS; echo; fi
 
-  local tries=0 max=5 wait=1 tmpcookie hdrfile token ok
+  local tries=0 max="${PSTORE_LOGIN_RETRIES:-10}" backoff="${PSTORE_LOGIN_BACKOFF:-2}" tmpcookie hdrfile token http_out http_status
   while (( tries < max )); do
     tries=$((tries+1))
     tmpcookie="$(mktemp)"
     hdrfile="${tmpcookie}.hdr"
-    if ! curl "${CURL_TLS[@]}" -s -X GET -H "Accept: application/json" -H "Content-Type: application/json" -u "${PSTORE_USER}:${PSTORE_PASS}" -c "${tmpcookie}" "https://${PSTORE_IP}/api/rest/login_session" -D "${hdrfile}" >/dev/null 2>&1; then
-      rm -f "$tmpcookie" "$hdrfile"
-      sleep $wait
-      wait=$((wait*2))
-      continue
+
+    if [[ "$DEBUG" == "1" ]]; then
+      echo "[debug] login attempt #$tries -> calling /api/rest/login_session (verbose output below)"
+      curl "${CURL_TLS[@]}" -v -X GET -H "Accept: application/json" -H "Content-Type: application/json" -u "${PSTORE_USER}:${PSTORE_PASS}" -c "${tmpcookie}" "https://${PSTORE_IP}/api/rest/login_session" -D "${hdrfile}" 2>&1 | sed -n '1,180p'
+    else
+      curl "${CURL_TLS[@]}" -s -X GET -H "Accept: application/json" -H "Content-Type: application/json" -u "${PSTORE_USER}:${PSTORE_PASS}" -c "${tmpcookie}" "https://${PSTORE_IP}/api/rest/login_session" -D "${hdrfile}" >/dev/null 2>&1 || true
     fi
+
     token="$(awk -F': ' '/DELL-EMC-TOKEN/ {print $2; exit}' "$hdrfile" | tr -d $'\r\n' || true)"
     if [[ -z "$token" ]]; then
       rm -f "$tmpcookie" "$hdrfile"
-      sleep $wait
-      wait=$((wait*2))
+      echo "  login attempt $tries: no DELL-EMC-TOKEN returned; retrying after ${backoff}s..."
+      sleep "$backoff"
+      backoff=$(( backoff * 2 ))
       continue
     fi
 
-    # quick validation: request 1 item and check HTTP status or content-range
-    http_out="$(curl -sS -w "\nHTTP_STATUS:%{http_code}\n" -H "DELL-EMC-TOKEN: ${token}" -b "$tmpcookie" "https://${PSTORE_IP}/api/rest/volume?limit=1" 2>/dev/null || true)"
-    http_status="$(awk -F: '/HTTP_STATUS/ {print $2}' <<<"$http_out" | tr -d ' \r\n' || true)"
+    # post-login sleep to avoid race where session not yet usable
+    if [[ -n "${PSTORE_LOGIN_POST_SLEEP:-}" && "${PSTORE_LOGIN_POST_SLEEP}" -gt 0 ]]; then
+      sleep "${PSTORE_LOGIN_POST_SLEEP}"
+    fi
+
+    # validate session by requesting a small page
+    if [[ "$DEBUG" == "1" ]]; then
+      http_out="$(curl "${CURL_TLS[@]}" -v -H "DELL-EMC-TOKEN: ${token}" -b "$tmpcookie" "https://${PSTORE_IP}/api/rest/volume?limit=1" 2>&1 || true)"
+      echo "[debug] validation output (truncated):"
+      printf '%s\n' "$http_out" | sed -n '1,200p'
+      http_status="$(awk -F: '/HTTP_STATUS/ {print $2}' <<<"$http_out" | tr -d ' \r\n' || true)"
+      # some verbose output may not include HTTP_STATUS; fallback to checking for "HTTP/1.1 2" lines
+      if [[ -z "$http_status" ]]; then
+        http_status="$(awk '/HTTP\/1\.[01] 2/ {print $2}' <<<"$http_out" | head -n1 || true)"
+      fi
+    else
+      http_out="$(curl -sS -w "\nHTTP_STATUS:%{http_code}\n" -H "DELL-EMC-TOKEN: ${token}" -b "$tmpcookie" "https://${PSTORE_IP}/api/rest/volume?limit=1" 2>/dev/null || true)"
+      http_status="$(awk -F: '/HTTP_STATUS/ {print $2}' <<<"$http_out" | tr -d ' \r\n' || true)"
+    fi
+
     if [[ "$http_status" == "200" || "$http_status" == "206" ]]; then
-      # persist unless user requested no-store
+      # persist session unless PSTORE_SESSION_NO_STORE == 1
       if [[ "${PSTORE_SESSION_NO_STORE:-}" == "1" ]]; then
         PSTORE_COOKIEFILE="$tmpcookie"
         PSTORE_TOKEN="$token"
@@ -158,6 +170,7 @@ _ps_login_and_store(){
         rm -f "$hdrfile"
         return 0
       fi
+
       mv "$tmpcookie" "$COOKIE_FILE_ON_DISK"
       chmod 600 "$COOKIE_FILE_ON_DISK"
       printf "%s" "$token" > "$TOKEN_FILE_ON_DISK"
@@ -166,15 +179,18 @@ _ps_login_and_store(){
       PSTORE_COOKIEFILE="$COOKIE_FILE_ON_DISK"
       PSTORE_TOKEN="$token"
       export PSTORE_COOKIEFILE PSTORE_TOKEN
-      echo "Stored session to $SESSION_DIR"
+      echo "Stored session to $SESSION_DIR (login attempts: $tries)."
       return 0
-    else
-      rm -f "$tmpcookie" "$hdrfile" || true
-      sleep $wait
-      wait=$((wait*2))
     fi
+
+    # failed validation - cleanup and backoff
+    rm -f "$tmpcookie" "$hdrfile"
+    echo "  login attempt $tries: session validation failed (HTTP $http_status). Retrying after ${backoff}s..."
+    sleep "$backoff"
+    backoff=$(( backoff * 2 ))
   done
-  die "Failed to create a valid PowerStore session after multiple attempts."
+
+  die "Failed to create a valid PowerStore session after ${max} attempts."
 }
 
 ensure_session(){
@@ -185,25 +201,46 @@ ensure_session(){
   _ps_login_and_store
 }
 
-# ps_api: runs authenticated GET and prints body and saves the last Content-Range (if any)
+# ps_api: make authenticated GET, capture Content-Range and optionally debug info
 LAST_CONTENT_RANGE_FILE="$TMPDIR/last_content_range.txt"
 ps_api() {
   local path="$1"
   ensure_session
-  # attach headers to a temp file to capture content-range
-  local hdrf=$(mktemp)
-  local body
-  body="$(curl -sS "${CURL_TLS[@]}" -D "$hdrf" -H "DELL-EMC-TOKEN: ${PSTORE_TOKEN}" -H "Accept: application/json" -b "${PSTORE_COOKIEFILE}" "https://${PSTORE_IP}$path")" || return 1
+  local hdrf body tmpout
+  hdrf="$(mktemp)"
+  tmpout="$(mktemp)"
+  # perform the request capturing headers and body
+  curl -sS "${CURL_TLS[@]}" -D "$hdrf" -H "DELL-EMC-TOKEN: ${PSTORE_TOKEN}" -H "Accept: application/json" -b "${PSTORE_COOKIEFILE}" "https://${PSTORE_IP}$path" -o "$tmpout" || { rm -f "$hdrf" "$tmpout"; return 1; }
+
+  # extract content-range if present
   awk 'BEGIN{IGNORECASE=1} /content-range/ {print $2}' "$hdrf" | tr -d '\r\n' > "$LAST_CONTENT_RANGE_FILE" || true
-  rm -f "$hdrf"
-  printf '%s' "$body"
+
+  # debug: print headers + a short preview of the body
+  if [[ "$DEBUG" == "1" ]]; then
+    echo "---- [debug] API call: GET $path ----"
+    sed -n '1,200p' "$hdrf"
+    echo "---- [debug] body preview (first 512 bytes) ----"
+    head -c 512 "$tmpout" | sed -n '1,200p'
+    echo "---- [debug] end ----"
+  fi
+
+  # output the body
+  cat "$tmpout"
+  rm -f "$hdrf" "$tmpout"
   return 0
 }
 
 ps_api_delete() {
   local path="$1"
   ensure_session
-  curl -sS "${CURL_TLS[@]}" -X DELETE -H "DELL-EMC-TOKEN: ${PSTORE_TOKEN}" -b "${PSTORE_COOKIEFILE}" "https://${PSTORE_IP}$path"
+  if [[ "$DEBUG" == "1" ]]; then
+    echo "---- [debug] API call: DELETE $path ----"
+    curl "${CURL_TLS[@]}" -v -X DELETE -H "DELL-EMC-TOKEN: ${PSTORE_TOKEN}" -b "${PSTORE_COOKIEFILE}" "https://${PSTORE_IP}$path" 2>&1 | sed -n '1,200p'
+    return $?
+  else
+    curl -sS "${CURL_TLS[@]}" -X DELETE -H "DELL-EMC-TOKEN: ${PSTORE_TOKEN}" -b "${PSTORE_COOKIEFILE}" "https://${PSTORE_IP}$path"
+    return $?
+  fi
 }
 
 # fetch all volumes with pagination; returns JSON array
@@ -211,34 +248,30 @@ fetch_all_volumes() {
   local limit=100 offset=0 seen="$TMPDIR/seen_ids.txt" allfile="$TMPDIR/all_objs.ndjson"
   : > "$seen"
   : > "$allfile"
-  local page_json new_count iterations=0 content_range
+  local page_json new_count iterations=0 content_range total
 
   while true; do
     iterations=$((iterations+1))
-    # call page
-    page_json="$(ps_api "/api/rest/volume?limit=${limit}&offset=${offset}")" || die "Failed fetching volumes"
+    page_json="$(ps_api "/api/rest/volume?limit=${limit}&offset=${offset}&select=id,name,mapped,created_timestamp")" || die "Failed fetching volumes"
     # normalize array wrapper
     if ! jq -e '.[0]' <<<"$page_json" >/dev/null 2>&1; then
       if jq -e '.content // .items' <<<"$page_json" >/dev/null 2>&1; then
         page_json="$(jq -c '.content // .items' <<<"$page_json")"
       else
-        # if zero results on first page, break
         if [[ "$iterations" -gt 1 ]]; then break; else die "Unexpected response from PowerStore volume API"; fi
       fi
     fi
 
-    # capture content-range once (from ps_api)
+    # read content-range from last call (ps_api saved it)
     if [[ -f "$LAST_CONTENT_RANGE_FILE" ]]; then
       content_range="$(<"$LAST_CONTENT_RANGE_FILE")"
-      # try to parse total if present (format 0-4/5040)
       if [[ -n "$content_range" && "$iterations" -eq 1 ]]; then
-        total="$(awk -F'/' '{print $2}' <<<"$content_range" | tr -d '\r\n')" || true
+        total="$(awk -F'/' '{print $2}' <<<"$content_range" | tr -d '\r\n' || true)"
         if [[ -n "$total" ]]; then echo "  PowerStore API reports total volumes: $total"; fi
       fi
     fi
 
     new_count=0
-    # iterate objects
     while IFS= read -r obj; do
       volid="$(jq -r '.id' <<<"$obj" 2>/dev/null || true)"
       [[ -n "$volid" && "$volid" != "null" ]] || continue
@@ -251,13 +284,12 @@ fetch_all_volumes() {
 
     if [[ "$new_count" -eq 0 ]]; then break; fi
     offset=$((offset + limit))
-    if [[ "$offset" -gt 1000000 ]]; then echo "Safety break"; break; fi
+    if [[ "$offset" -gt 1000000 ]]; then echo "Safety break: offset exceeded large threshold"; break; fi
   done
 
   if [[ -s "$allfile" ]]; then jq -s '.' "$allfile"; else echo "[]"; fi
 }
 
-# CSV helper
 csv_escape(){ local s="${1:-}"; s="${s//\"/\"\"}"; printf '"%s"' "$s"; }
 
 # 1) gather PV volumeHandles
@@ -283,7 +315,7 @@ fi
 
 # 3) Pull all volumes (paginated)
 echo "Collecting PowerStore volumes (paginated)..."
-VOL_JSON="$(fetch_all_volumes)" || die "Failed fetching volumes"
+VOL_JSON="$(fetch_all_volumes)" || die "ERROR: Failed fetching volumes"
 echo "$VOL_JSON" > "$TMPDIR/volumes.json"
 jq -r '.[] | [ .id, (.name//""), (.created_timestamp//""), (if (.mapped==true) then "true" else "false" end) ] | @tsv' "$TMPDIR/volumes.json" > "$TMPDIR/volumes.tsv"
 TOTAL_VOLS="$(wc -l < "$TMPDIR/volumes.tsv" | tr -d ' ')"
@@ -310,7 +342,7 @@ UNMAPPED_ORPHANS="$(wc -l < "$TMPDIR/orphans_unmapped.tsv" | tr -d ' ')"
 echo "  Unmapped orphan candidates: $UNMAPPED_ORPHANS"
 echo
 
-# 7) CSV header
+# 7) CSV header (age_days added)
 {
   echo "run_timestamp,namespace_scope,dry_run,delete_count,action,volume_id,volume_name,created_timestamp,mapped,age_days,eligible_for_delete,reason,pv_name,pvc_namespace,pvc_name,protected_by_datavolume"
 } > "$REPORT"
@@ -347,13 +379,12 @@ while IFS=$'\t' read -r VOL_ID VOL_NAME CREATED_TS MAPPED; do
   # age in days
   age_days=""
   if [[ -n "$CREATED_TS" ]]; then
-    # created_timestamp often like "2025-11-17T16:45:00.000Z" -> convert with date
     if date -d "$CREATED_TS" >/dev/null 2>&1; then
       age_days=$(( ( $(date +%s) - $(date -d "$CREATED_TS" +%s) ) / 86400 ))
     fi
   fi
 
-  # write row
+  # write CSV row
   {
     csv_escape "$TS_NOW"; echo -n ","
     csv_escape "${NAMESPACE:-}"; echo -n ","
@@ -380,7 +411,6 @@ while IFS=$'\t' read -r VOL_ID VOL_NAME CREATED_TS MAPPED; do
       if [[ "$DRY_RUN" == "1" ]]; then :; else
         if ps_api_delete "/api/rest/volume/${VOL_ID}" >/dev/null 2>&1; then
           DELETE_ATTEMPTED=$((DELETE_ATTEMPTED + 1))
-          # deletion row
           {
             csv_escape "$TS_NOW"; echo -n ","
             csv_escape "${NAMESPACE:-}"; echo -n ","
@@ -427,7 +457,7 @@ while IFS=$'\t' read -r VOL_ID VOL_NAME CREATED_TS MAPPED; do
 
 done < "$TMPDIR/orphans_unmapped.tsv"
 
-# Preview if requested
+# preview if requested
 if [[ "$PREVIEW_N" -gt 0 ]]; then
   echo
   echo "Preview: first $PREVIEW_N eligible candidate IDs:"
