@@ -10,13 +10,27 @@ set -euo pipefail
 #   - 401 = auth/session issue; script will re-login and retry once
 #
 # REQUIREMENTS: bash, curl, jq, kubectl
+# Usage examples:
+# 
+# Example 1:
+# Report-only, show candidates:
+# PSTORE_IP=powerstore.byu.edu ./psclean.sh --dr --k8s-only --verify-max 2000 --preview 20
+#
+# Example 2:
+# Delete in tiny batches, with an auditable CSV that includes 204/422 outcomes:
+# PSTORE_IP=powerstore.byu.edu ./psclean.sh --dc 5 --k8s-only --verify-max 2000
+#
+# Example 3:
+# If you want to skip the “Type DELETE” prompt:
+# PSTORE_IP=powerstore.byu.edu ./psclean.sh --dc 5 --yes --k8s-only --verify-max 2000
+#
+#
+#
 # This script determines “potentially orphaned” volumes purely by Kubernetes reference, then optionally confirms safety via PowerStore delete guardrails.
 # How “potentially orphaned” is computed
 # From OpenShift, it collects all PVs provisioned by the PowerStore CSI driver and extracts their spec.csi.volumeHandle.
 #
-# Example:
-#
-# Given a specific volumeHandle: 093189c9-.../PSe3e88a4bb089/scsi
+# For Example, given a specific volumeHandle: 093189c9-.../PSe3e88a4bb089/scsi
 # The script takes the VID part before the first /: 093189c9-...
 # So it builds a set: IN_USE_VIDS = “volumes Kubernetes knows about”.
 # From PowerStore, it lists volumes via:
@@ -43,6 +57,9 @@ set -euo pipefail
 #
 # I will work on a better version of this script that will query the PowerStore via ssh cli commands
 # to get a list of volumes that aren't mapped to any hosts and cross reference those to openshift instead
+
+
+
 
 ########################################
 # Defaults / env
