@@ -1,12 +1,5 @@
 #!/usr/bin/env bash
-# psclean.sh - PowerStore/OpenShift reconciliation with admin verification and detail dump support.
-# Features:
-#  - --dump-details N  : save verbose per-volume responses for first N orphan candidates (non-destructive)
-#  - --admin-user      : prompt for admin username/password and use separate admin session for verification
-#  - session caching (cookie + token) for normal and admin sessions
-#  - bounded per-volume verification (--verify-max) in dry-run, always verify before deletes
-#  - CSV reports saved to storage_reports/
-#
+# psclean.sh - PowerStore/OpenShift reconciliation (patched dump-details unbound-var fix)
 set -euo pipefail
 
 CSI_DRIVER="${CSI_DRIVER:-csi-powerstore.dellemc.com}"
@@ -35,10 +28,6 @@ Usage:
   PSTORE_IP=... ./psclean.sh [--dr|--dry-run] [--dc N|--delete-count N] [--ns NS]
                              [--protect-dv] [--relogin] [--k8s-only] [--preview N]
                              [--verify-max N] [--debug] [--dump-details N] [--admin-user]
-Flags:
-  --dump-details N    Save verbose details for first N orphan volumes (non-destructive)
-  --admin-user        Prompt for admin creds and use admin session for verification
-Other flags as before.
 USAGE
 }
 
@@ -83,7 +72,6 @@ REPORT="$REPORT_DIR/psclean_report_${TS_NOW}.csv"
 TMPDIR="$(mktemp -d)"
 trap 'rm -rf "$TMPDIR"' EXIT
 
-# Session files
 COOKIE_FILE_ON_DISK="$SESSION_DIR/cookie.file"
 TOKEN_FILE_ON_DISK="$SESSION_DIR/token.txt"
 ADMIN_COOKIE="$SESSION_DIR/admin_cookie.file"
@@ -101,7 +89,7 @@ echo "  Force relogin   : $FORCE_RELOGIN"
 echo "  K8s-only filter : $K8S_ONLY"
 echo "  Preview N       : $PREVIEW_N"
 echo "  Debug           : $DEBUG"
-echo "  Dump details    : $DUMP_DETAILS (N=$DUMP_MAX)"
+echo "  Dump details    : $DUMP_DETAILS (N=${DUMP_MAX:-0})"
 echo "  Use admin       : $USE_ADMIN"
 echo "  Report          : $REPORT"
 echo "  Session dir     : $SESSION_DIR"
@@ -133,7 +121,6 @@ load_admin_session_if_exists(){
   return 1
 }
 
-# login helper (common)
 _login_and_store_session(){
   local user="$1" pass="$2" cookie_out="$3" token_out="$4" debug="$5"
   local tries=0 max="$PSTORE_LOGIN_RETRIES" backoff="$PSTORE_LOGIN_BACKOFF"
@@ -155,9 +142,7 @@ _login_and_store_session(){
       sleep "$backoff"; backoff=$((backoff*2))
       continue
     fi
-    # brief post sleep to avoid race
     [[ "$PSTORE_LOGIN_POST_SLEEP" -gt 0 ]] && sleep "$PSTORE_LOGIN_POST_SLEEP"
-    # validate with small call
     status="$(curl -sS "${CURL_TLS[@]}" -w "%{http_code}" -o /dev/null -H "DELL-EMC-TOKEN: ${token}" -b "$tmpcookie" "https://${PSTORE_IP}/api/rest/volume?limit=1" 2>/dev/null || true)"
     if [[ "$status" == "200" || "$status" == "206" ]]; then
       mv "$tmpcookie" "$cookie_out"
@@ -173,7 +158,6 @@ _login_and_store_session(){
   return 1
 }
 
-# standard session
 ensure_session(){
   if [[ -n "${PSTORE_COOKIEFILE:-}" && -n "${PSTORE_TOKEN:-}" ]]; then return 0; fi
   if load_session_if_exists; then return 0; fi
@@ -182,17 +166,14 @@ ensure_session(){
     PSTORE_COOKIEFILE="$COOKIE_FILE_ON_DISK"; PSTORE_TOKEN="$(<"$TOKEN_FILE_ON_DISK")"; export PSTORE_COOKIEFILE PSTORE_TOKEN
     return 0
   fi
-  # prompt
   read -rp "PowerStore username: " PSTORE_USER
   read -s -rp "PowerStore password for ${PSTORE_USER}: " PSTORE_PASS; echo
   _login_and_store_session "$PSTORE_USER" "$PSTORE_PASS" "$COOKIE_FILE_ON_DISK" "$TOKEN_FILE_ON_DISK" "$DEBUG" || die "Failed to login (user session)"
   PSTORE_COOKIEFILE="$COOKIE_FILE_ON_DISK"; PSTORE_TOKEN="$(<"$TOKEN_FILE_ON_DISK")"; export PSTORE_COOKIEFILE PSTORE_TOKEN
 }
 
-# admin session (optional)
 ensure_admin_session(){
   if load_admin_session_if_exists; then return 0; fi
-  # prompt for admin creds
   read -rp "PowerStore admin user: " PSTORE_ADMIN_USER
   read -s -rp "PowerStore admin password: " PSTORE_ADMIN_PASS; echo
   if _login_and_store_session "$PSTORE_ADMIN_USER" "$PSTORE_ADMIN_PASS" "$ADMIN_COOKIE" "$ADMIN_TOKEN_FILE" "$DEBUG"; then
@@ -203,11 +184,8 @@ ensure_admin_session(){
   return 1
 }
 
-# GET helper (JSON-safe)
-ps_api() {
-  local path="$1" cookievar tokenvar
-  cookievar="${PSTORE_COOKIEFILE:-$COOKIE_FILE_ON_DISK}"
-  tokenvar="${PSTORE_TOKEN:-}"
+ps_api(){
+  local path="$1"
   ensure_session
   local hdrf bodyf
   hdrf="$(mktemp)"; bodyf="$(mktemp)"
@@ -221,12 +199,10 @@ ps_api() {
     head -c 200 "$bodyf"; echo >&2
     rm -f "$hdrf" "$bodyf"; return 1
   fi
-  cat "$bodyf"
-  rm -f "$hdrf" "$bodyf"
+  cat "$bodyf"; rm -f "$hdrf" "$bodyf"
 }
 
-# Admin GET helper (uses admin session if available)
-ps_api_admin() {
+ps_api_admin(){
   local path="$1"
   if [[ -n "${PSTORE_ADMIN_TOKEN:-}" && -n "${PSTORE_ADMIN_COOKIE:-}" ]]; then
     local hdrf bodyf
@@ -243,7 +219,6 @@ ps_api_admin() {
     fi
     cat "$bodyf"; rm -f "$hdrf" "$bodyf"; return 0
   else
-    # fallback to normal API
     ps_api "$path"
   fi
 }
@@ -254,14 +229,12 @@ ps_api_delete(){
   curl -sS "${CURL_TLS[@]}" -X DELETE -H "DELL-EMC-TOKEN: ${PSTORE_TOKEN}" -b "${PSTORE_COOKIEFILE}" "https://${PSTORE_IP}${path}"
 }
 
-# fetch volumes with select=id,name (fallback to id-only)
 fetch_vol_page(){
   local limit="$1" offset="$2" resp
   resp="$(ps_api "/api/rest/volume?limit=${limit}&offset=${offset}&select=id,name" || true)"
   if [[ -n "$resp" ]] && jq -e 'type=="array"' <<<"$resp" >/dev/null 2>&1; then
     echo "$resp"; return 0
   fi
-  # fall back to id-only
   ps_api "/api/rest/volume?limit=${limit}&offset=${offset}"
 }
 
@@ -270,7 +243,6 @@ fetch_all_volumes(){
   local page count first=1
   while true; do
     page="$(fetch_vol_page "$limit" "$offset")" || die "Failed fetching volumes"
-    # normalize wrapper
     if ! jq -e 'type=="array"' <<<"$page" >/dev/null 2>&1; then
       if jq -e '.content // .items' <<<"$page" >/dev/null 2>&1; then
         page="$(jq -c '.content // .items' <<<"$page")"
@@ -295,14 +267,12 @@ fetch_all_volumes(){
 
 csv_escape(){ local s="${1:-}"; s="${s//\"/\"\"}"; printf '"%s"' "$s"; }
 
-# Collect PV handles
 echo "Collecting PowerStore CSI PV volumeHandles from OpenShift..."
 kubectl get pv -o json > "$TMPDIR/pv.json"
 jq -r --arg d "$CSI_DRIVER" '.items[]? | select(.spec.csi.driver==$d) | .spec.csi.volumeHandle' "$TMPDIR/pv.json" | sort -u > "$TMPDIR/inuse_handles_all.txt"
 INUSE_COUNT="$(wc -l < "$TMPDIR/inuse_handles_all.txt" | tr -d ' ')"
 echo "  Found in-use volumeHandles (all namespaces): $INUSE_COUNT"
 
-# optional DataVolumes
 DV_PROTECTED_SET="$TMPDIR/dv_protected.txt"
 if [[ "$PROTECT_DV" == "1" ]]; then
   echo "Collecting KubeVirt DataVolumes to protect referenced PVs..."
@@ -315,14 +285,12 @@ if [[ "$PROTECT_DV" == "1" ]]; then
   fi
 fi
 
-# Gather volumes
 echo "Collecting PowerStore volumes (paginated)..."
 VOL_JSON="$(fetch_all_volumes)" || die "Failed fetching volumes"
 echo "$VOL_JSON" > "$TMPDIR/volumes.json"
 TOTAL_VOLS="$(jq 'length' "$TMPDIR/volumes.json")"
 echo "  Total volumes fetched from list API: $TOTAL_VOLS"
 
-# check name presence
 HAS_NAME=0
 if jq -e '.[0] | has("name")' "$TMPDIR/volumes.json" >/dev/null 2>&1; then HAS_NAME=1; fi
 
@@ -343,7 +311,6 @@ echo "Computing orphan candidates (not referenced by any PV volumeHandle)..."
 echo "  Orphan IDs (unreferenced): $ORPHAN_ID_COUNT"
 echo
 
-# CSV header
 {
   echo "run_timestamp,namespace_scope,dry_run,delete_count,verify_max,action,volume_id,volume_name,mapped,verified,eligible_for_delete,reason,pv_name,pvc_namespace,pvc_name,protected_by_datavolume"
 } > "$REPORT"
@@ -353,9 +320,9 @@ lookup_name(){
   jq -r --arg id "$vid" 'first(.[] | select(.id==$id) | (.name // "")) // ""' "$TMPDIR/volumes.json" 2>/dev/null || true
 }
 
-# per-volume detail: uses admin if requested&available else normal
 get_volume_details(){
-  local vid="$1"
+  local vid="${1:-}"
+  if [[ -z "$vid" ]]; then echo "{}"; return 0; fi
   if [[ "$USE_ADMIN" == "1" ]]; then
     if ! load_admin_session_if_exists; then
       if ! ensure_admin_session; then
@@ -370,17 +337,28 @@ get_volume_details(){
   fi
 }
 
-# Detail dump helper (verbose)
 dump_detail_for_vid(){
-  local vid="$1" out="$DETAIL_DIR/${vid}.txt"
-  echo "=== DUMP: $vid ===" > "$out"
-  echo "REQUEST: GET /api/rest/volume/${vid} (verbose output)" >> "$out"
-  echo >> "$out"
-  # verbose request (headers + body)
-  curl "${CURL_TLS[@]}" -v -H "DELL-EMC-TOKEN: ${PSTORE_TOKEN}" -b "${PSTORE_COOKIEFILE}" "https://${PSTORE_IP}/api/rest/volume/${vid}" 2>&1 | sed -n '1,400p' >> "$out" || true
+  local vid="${1:-}"
+  if [[ -z "$vid" ]]; then
+    echo "[dump] called without vid; skipping" >&2
+    return 0
+  fi
+  # ensure session exists before we attempt verbose curl
+  if ! ensure_session >/dev/null 2>&1; then
+    echo "[dump] no session available for vid=$vid; skipping" >&2
+    return 0
+  fi
+  local out="$DETAIL_DIR/${vid}.txt"
+  {
+    echo "=== DUMP: $vid ==="
+    echo "REQUEST: GET /api/rest/volume/${vid} (verbose output)"
+    echo
+  } > "$out"
+  # verbose headers+body preview
+  curl "${CURL_TLS[@]}" -v -H "DELL-EMC-TOKEN: ${PSTORE_TOKEN:-}" -b "${PSTORE_COOKIEFILE:-}" "https://${PSTORE_IP}/api/rest/volume/${vid}" 2>&1 | sed -n '1,400p' >> "$out" || true
   echo >> "$out"
   echo "REQUEST: GET /api/rest/volume/${vid}?select=id,name,mapped,host_mappings (probe)" >> "$out"
-  curl "${CURL_TLS[@]}" -s -H "DELL-EMC-TOKEN: ${PSTORE_TOKEN}" -b "${PSTORE_COOKIEFILE}" \
+  curl "${CURL_TLS[@]}" -s -H "DELL-EMC-TOKEN: ${PSTORE_TOKEN:-}" -b "${PSTORE_COOKIEFILE:-}" \
     "https://${PSTORE_IP}/api/rest/volume/${vid}?select=id,name,mapped,host_mappings" | sed -n '1,200p' >> "$out" || true
   echo >> "$out"
   echo "REQUEST: GET /api/rest/volume/${vid} (admin probe, if admin session present)" >> "$out"
@@ -392,7 +370,6 @@ dump_detail_for_vid(){
   fi
 }
 
-# Loop through orphan IDs and verify bounded
 VERIFIED_COUNT=0
 ELIGIBLE_VERIFIED=0
 DELETE_ATTEMPTED=0
@@ -408,13 +385,12 @@ while IFS= read -r VOL_ID; do
   VERIFIED="no"; ELIGIBLE="no"; REASON="Unreferenced by PV volumeHandle (not verified)"
 
   # if dump-details requested and under limit, capture raw responses
-  if [[ "$DUMP_DETAILS" == "1" && "$DUMPED" -lt "$DUMP_MAX" ]]; then
-    ensure_session
+  if [[ "$DUMP_DETAILS" == "1" && "$DUMPED" -lt "${DUMP_MAX:-0}" ]]; then
+    # spawn background dump but guard against unset vars inside function
     dump_detail_for_vid "$VOL_ID" &
     DUMPED=$((DUMPED+1))
   fi
 
-  # decide whether to verify this candidate
   DO_VERIFY=0
   if [[ "$DELETE_COUNT" -gt 0 ]]; then DO_VERIFY=1; fi
   if [[ "$DRY_RUN" == "1" && "$VERIFIED_COUNT" -lt "$VERIFY_MAX" ]]; then DO_VERIFY=1; fi
@@ -424,16 +400,13 @@ while IFS= read -r VOL_ID; do
     if [[ -n "$DETAILS_JSON" && "$DETAILS_JSON" != "{}" ]]; then
       VERIFIED="yes"
       VERIFIED_COUNT=$((VERIFIED_COUNT+1))
-      # mapped may exist on detail; if absent remain "unknown"
       MAPPED="$(jq -r 'if has("mapped") then (if .mapped==true then "true" else "false" end) else "unknown" end' <<<"$DETAILS_JSON" 2>/dev/null || echo "unknown")"
       PV_NAME="$(jq -r '.metadata["csi.volume.kubernetes.io/pv/name"] // ""' <<<"$DETAILS_JSON" 2>/dev/null || true)"
       PVC_NS="$(jq -r '.metadata["csi.volume.kubernetes.io/pvc/namespace"] // ""' <<<"$DETAILS_JSON" 2>/dev/null || true)"
       PVC_NAME="$(jq -r '.metadata["csi.volume.kubernetes.io/pvc/name"] // ""' <<<"$DETAILS_JSON" 2>/dev/null || true)"
-      # DV protection
       if [[ "$PROTECT_DV" == "1" && -n "$PV_NAME" && -f "$DV_PROTECTED_SET" ]]; then
         if grep -qFx "$PV_NAME" "$DV_PROTECTED_SET" 2>/dev/null; then PROTECTED_BY_DV="yes"; fi
       fi
-      # eligibility logic
       if [[ "$MAPPED" == "false" ]]; then
         if [[ -n "$NAMESPACE" ]]; then
           if [[ -z "$PVC_NS" ]]; then ELIGIBLE="no"; REASON="Namespace-scoped run: missing PVC namespace metadata"; fi
@@ -452,7 +425,6 @@ while IFS= read -r VOL_ID; do
     fi
   fi
 
-  # write CSV row
   {
     csv_escape "$TS_NOW"; echo -n ","
     csv_escape "${NAMESPACE:-}"; echo -n ","
@@ -478,9 +450,7 @@ while IFS= read -r VOL_ID; do
     VERIFIED_ELIGIBLE_IDS+=("$VOL_ID")
   fi
 
-  # delete logic (non-dry-run)
   if [[ "$DRY_RUN" == "0" && "$DELETE_COUNT" -gt 0 && "$DELETE_ATTEMPTED" -lt "$DELETE_COUNT" ]]; then
-    # ensure verified before delete
     if [[ "$VERIFIED" != "yes" ]]; then
       DETAILS_JSON="$(get_volume_details "$VOL_ID")"
       if [[ "$DETAILS_JSON" == "{}" ]]; then continue; fi
@@ -488,7 +458,6 @@ while IFS= read -r VOL_ID; do
       PV_NAME="$(jq -r '.metadata["csi.volume.kubernetes.io/pv/name"] // ""' <<<"$DETAILS_JSON" 2>/dev/null || true)"
       PVC_NS="$(jq -r '.metadata["csi.volume.kubernetes.io/pvc/namespace"] // ""' <<<"$DETAILS_JSON" 2>/dev/null || true)"
       PVC_NAME="$(jq -r '.metadata["csi.volume.kubernetes.io/pvc/name"] // ""' <<<"$DETAILS_JSON" 2>/dev/null || true)"
-      # recalc eligibility
       if [[ "$MAPPED" == "false" && "$PROTECTED_BY_DV" == "no" ]]; then
         if [[ -n "$NAMESPACE" ]]; then
           [[ -n "$PVC_NS" && "$PVC_NS" == "$NAMESPACE" ]] && ELIGIBLE="yes" || ELIGIBLE="no"
@@ -548,7 +517,6 @@ while IFS= read -r VOL_ID; do
 
 done < "$TMPDIR/orphan_ids.txt"
 
-# wait for any background dumps to finish
 wait || true
 
 echo
@@ -563,7 +531,7 @@ else
 fi
 echo "  CSV report                           : $REPORT"
 if [[ "$DUMP_DETAILS" == "1" ]]; then
-  echo "  Detail dumps saved to               : $DETAIL_DIR (first $DUMP_MAX attempted)"
+  echo "  Detail dumps saved to               : $DETAIL_DIR (first ${DUMP_MAX:-0} attempted)"
 fi
 
 echo
