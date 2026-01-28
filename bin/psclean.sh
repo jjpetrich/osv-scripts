@@ -10,6 +10,39 @@ set -euo pipefail
 #   - 401 = auth/session issue; script will re-login and retry once
 #
 # REQUIREMENTS: bash, curl, jq, kubectl
+# This script determines “potentially orphaned” volumes purely by Kubernetes reference, then optionally confirms safety via PowerStore delete guardrails.
+# How “potentially orphaned” is computed
+# From OpenShift, it collects all PVs provisioned by the PowerStore CSI driver and extracts their spec.csi.volumeHandle.
+#
+# Example:
+#
+# Given a specific volumeHandle: 093189c9-.../PSe3e88a4bb089/scsi
+# The script takes the VID part before the first /: 093189c9-...
+# So it builds a set: IN_USE_VIDS = “volumes Kubernetes knows about”.
+# From PowerStore, it lists volumes via:
+# GET /api/rest/volume?limit=…&offset=… (paged)
+# and collects their id values into a set: ARRAY_VIDS.
+# Then it computes:
+# ORPHAN_CANDIDATES = ARRAY_VIDS − IN_USE_VIDS
+# So, in plain terms:
+# A PowerStore volume is “potentially orphaned” if it exists on the array but is not referenced by any Kubernetes PV volumeHandle.
+# Does it check if a volume is mapped to a host?
+# I tried, but couldn't figure out how to do this directly 
+# (because you can’t reliably fetch mapped / host_mappings / etc. via the PowerStore REST API).
+# 
+# When you run the script with --dc N (and not --dr), it does something a bit stronger:
+# It attempts DELETE /api/rest/volume/<vid>
+# If PowerStore returns 204, the volume was deletable (and is now deleted).
+# If PowerStore returns 422, it was not deletable, and the response tells you why (e.g., “attached to <host_id>”).
+# That 422 response is effectively PowerStore saying:
+# “This volume is not orphaned / not safe to delete because it’s still attached / in use.”
+# 
+# Because PowerStore 4.1 REST responses don't seem to return a valid “mapping state”, the safest practical method is:
+# Use Kubernetes to find “unreferenced by cluster”
+# Use PowerStore DELETE to enforce “safe/unsafe” (422 blocks unsafe)
+#
+# I will work on a better version of this script that will query the PowerStore via ssh cli commands
+# to get a list of volumes that aren't mapped to any hosts and cross reference those to openshift instead
 
 ########################################
 # Defaults / env
