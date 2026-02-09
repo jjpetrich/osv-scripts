@@ -111,6 +111,26 @@ INCLUDE_CONTROLLERS=0
 #SORT_COLUMN="BOOKED"
 SORT_COLUMN="NODE"
 
+# ---------------- Sortable Columns (for --sort-col) ----------------
+# Canonical, case-insensitive column names that can be used with --sort-col.
+declare -A SORT_COL_MAP=(
+  [NODE]=1
+  [STATUS]=1
+  [ROLES]=1
+  [ALLOCGI]=1
+  [BOOKEDGI]=1
+  [BOOKED%]=1
+  [USAGEGI]=1
+  [USED%]=1
+  [CPU_ALLOC]=1
+  [CPU_BOOK]=1
+  [CPU_BOOKED%]=1
+  [CPU_USE]=1
+  [CPU_USED%]=1
+  [CPU_CORES]=1
+  [CAPACITY_GI]=1
+)
+
 # ---------------- Color Thresholds ----------------
 MAX_GREEN=79      # Percent value at or below this is GREEN
 MAX_YELLOW=89     # Percent up to here (and above MAX_GREEN) is YELLOW
@@ -136,30 +156,15 @@ while [[ $# -gt 0 ]]; do
     --include-controllers) INCLUDE_CONTROLLERS=1; shift ;;
     --sort-col)
       val="${2:-}"
-      case "$val" in
-        NODE|node|Node)
-          SORT_COLUMN="NODE"
-          ;;
-        R|ROLES|roles|Roles)
-          SORT_COLUMN="ROLES"
-          ;;
-        B|b|BOOKED|booked|Booked|BOOKED%|booked%|Booked%)
-          SORT_COLUMN="BOOKED%"
-          ;;
-        U|u|USED|used|Used|USED%|used%|Used%)
-          SORT_COLUMN="USED%"
-          ;;
-        CPU_BOOKED|cpu_booked|Cpu_booked|CPU_BOOKED%|cpu_booked%|Cpu_booked%)
-          SORT_COLUMN="CPU_BOOKED%"
-          ;;
-        CPU_USED|cpu_used|Cpu_used|CPU_USED%|cpu_used%|Cpu_used%)
-          SORT_COLUMN="CPU_USED%"
-          ;;
-        *)
-          echo "ERROR: --sort-column must be one of NODE, ROLES, BOOKED%, USED%, CPU_BOOKED%, CPU_USED% (got '$val')" >&2
-          exit 1
-          ;;
-      esac
+      key="$(printf '%s' "$val" | tr '[:lower:]' '[:upper:]')"
+      if [[ -z "${SORT_COL_MAP[$key]:-}" ]]; then
+        echo "ERROR: Invalid --sort-col '$val'" >&2
+        echo "Valid columns:" >&2
+        printf '%s
+' "${!SORT_COL_MAP[@]}" | sort | sed 's/^/  /' >&2
+        exit 1
+      fi
+      SORT_COLUMN="$key"
       shift 2 ;;
     --version) print_version; exit 0 ;;
     -h|--help|help) echo "$HELP_TEXT"; exit 0 ;;
@@ -672,7 +677,7 @@ fi
 
 if [[ $HAS_USAGE -eq 0 ]]; then
   case "$SORT_COLUMN" in
-    USED%|CPU_USED%|CPU_BOOKED%)
+    USED%|USAGEGI|CPU_USED%|CPU_USE)
       echo "WARN: --sort-column $SORT_COLUMN requested, but no usage metrics collected; sorting by NODE instead." >&2
       SORT_COLUMN="NODE"
       ;;
