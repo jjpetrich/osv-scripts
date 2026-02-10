@@ -784,7 +784,7 @@ if [[ $NODE_SCOPE_MAIN -eq 1 && -n "$NODE_FILTER" ]]; then
 fi
 
 # Build header line
-header="NODE                STATUS                       ROLES                     ALLOCGi   BOOKEDGi  BOOKED%"
+header="NODE                STATUS                       ROLES                        ALLOCGi   BOOKEDGi  BOOKED%"
 if [[ $HAS_USAGE -eq 1 ]]; then
   header="$header USAGEGi   USED%"
 fi
@@ -885,7 +885,7 @@ function colorpct(p,w,   col,s,pad){
         }
       }
 
-      line = sprintf("%-19s %-28s %-25s %-9.2f %-9.2f %-s",
+      line = sprintf("%-19s %-28s %-28s %-9.2f %-9.2f %-s",
                      node, status, role, aGi, bGi, bPctS);
 
       if (has_usage){
