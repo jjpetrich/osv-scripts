@@ -36,6 +36,8 @@ OPTIONS
   --namespace, -n NS       Restrict to a single namespace
   --debug                  Print diagnostics & per-pod list (Requests [+Limits/Usage])
   --debug-all-pods         With --debug, print all per-pod lines (instead of first 200)
+  --debug-sort-col COL      With --debug, sort per-pod list by COL (case-insensitive): NAME, NODE, REQ_MEM, USAGE_MEM, LIM_MEM, REQ_CPU, USAGE_CPU, LIM_CPU
+                           (default: NAME)
   --node NAME              (debug) Show only pods scheduled on the given node; implies
                            untruncated per-pod list
   --node-scope-main        Also scope the main tables to the single node given
@@ -101,6 +103,7 @@ NODE_SCOPE_MAIN=0
 NAMESPACE=""
 DEBUG=0
 DEBUG_ALL_PODS=0
+DEBUG_SORT_COLUMN=\"NAME\"
 SHOW_LIMITS=0
 SHOW_USAGE=1
 SHOW_NODE_CAPACITY=0
@@ -112,8 +115,7 @@ INCLUDE_CONTROLLERS=0
 SORT_COLUMN="NODE"
 
 # ---------------- Sortable Columns (for --sort-col) ----------------
-# Canonical, case-insensitive column reminder for --sort-col.
-# Note: Some columns only appear when the corresponding data is present.
+# Canonical, case-insensitive column names that can be used with --sort-col.
 declare -A SORT_COL_MAP=(
   [NODE]=1
   [STATUS]=1
@@ -132,6 +134,18 @@ declare -A SORT_COL_MAP=(
   [CAPACITY_GI]=1
 )
 
+# ---------------- Sortable Columns (for --debug-sort-col) ----------------
+declare -A DEBUG_SORT_COL_MAP=(
+  [NAME]=1
+  [NODE]=1
+  [REQ_MEM]=1
+  [USAGE_MEM]=1
+  [LIM_MEM]=1
+  [REQ_CPU]=1
+  [USAGE_CPU]=1
+  [LIM_CPU]=1
+)
+
 # ---------------- Color Thresholds ----------------
 MAX_GREEN=79      # Percent value at or below this is GREEN
 MAX_YELLOW=89     # Percent up to here (and above MAX_GREEN) is YELLOW
@@ -146,6 +160,26 @@ while [[ $# -gt 0 ]]; do
     --namespace|-n) NAMESPACE="${2:-}"; shift 2 ;;
     --debug) DEBUG=1; shift ;;
     --debug-all-pods) DEBUG=1; DEBUG_ALL_PODS=1; shift ;;
+    --debug-sort-col)
+      val="${2:-}"
+      key="$(printf '%s' "$val" | tr '[:lower:]' '[:upper:]')"
+      case "$key" in
+        POD|PODS|NAMESPACE/POD|NAMESPACE_POD) key="NAME";;
+        REQMEM) key="REQ_MEM";;
+        USAGEMEM) key="USAGE_MEM";;
+        LIMMEM|LIMITMEM) key="LIM_MEM";;
+        REQCPU) key="REQ_CPU";;
+        USAGECPU) key="USAGE_CPU";;
+        LIMCPU|LIMITCPU) key="LIM_CPU";;
+      esac
+      if [[ -z "${DEBUG_SORT_COL_MAP[$key]:-}" ]]; then
+        echo "ERROR: Invalid --debug-sort-col '$val'" >&2
+        echo "Valid debug columns:" >&2
+        printf '%s\n' "${!DEBUG_SORT_COL_MAP[@]}" | sort | sed 's/^/  /' >&2
+        exit 1
+      fi
+      DEBUG_SORT_COLUMN="$key"
+      shift 2 ;;
     --node) NODE_FILTER="${2:-}"; shift 2 ;;
     --node-scope-main) NODE_SCOPE_MAIN=1; shift ;;
     --show-limits) SHOW_LIMITS=1; shift ;;
@@ -158,17 +192,14 @@ while [[ $# -gt 0 ]]; do
     --sort-col)
       val="${2:-}"
       key="$(printf '%s' "$val" | tr '[:lower:]' '[:upper:]')"
-      key="${key//-/_}"
-      key="${key// /}"
 
       # Back-compat aliases
       case "$key" in
-        B|BOOKED) key="BOOKED%" ;;
-        U|USED) key="USED%" ;;
-        CPU_BOOKED) key="CPU_BOOKED%" ;;
-        CPU_USED) key="CPU_USED%" ;;
-        CPU%) key="CPU_USED%" ;;
-        CAPACITYGI) key="CAPACITY_GI" ;;
+        R) key="ROLES";;
+        B|BOOKED) key="BOOKED%";;
+        U|USED) key="USED%";;
+        CPU_BOOKED) key="CPU_BOOKED%";;
+        CPU_USED|CPU%) key="CPU_USED%";;
       esac
 
       if [[ -z "${SORT_COL_MAP[$key]:-}" ]]; then
@@ -178,7 +209,6 @@ while [[ $# -gt 0 ]]; do
 ' "${!SORT_COL_MAP[@]}" | sort | sed 's/^/  /' >&2
         exit 1
       fi
-
       SORT_COLUMN="$key"
       shift 2 ;;
     --version) print_version; exit 0 ;;
@@ -642,38 +672,79 @@ if [[ $DEBUG -eq 1 && -n "$PER_POD_TSV" ]]; then
     LIMIT_LINES=200
   fi
 
+  # Debug list sorting
+  DEBUG_SORT_MODE="num_desc"
+  if [[ "$DEBUG_SORT_COLUMN" == "NAME" || "$DEBUG_SORT_COLUMN" == "NODE" ]]; then
+    DEBUG_SORT_MODE="str_asc"
+  fi
+  if [[ $HAS_USAGE -eq 0 ]]; then
+    case "$DEBUG_SORT_COLUMN" in
+      USAGE_MEM|USAGE_CPU)
+        echo "WARN: --debug-sort-col $DEBUG_SORT_COLUMN requested, but no usage metrics collected; sorting by NAME instead." >&2
+        DEBUG_SORT_COLUMN="NAME"
+        DEBUG_SORT_MODE="str_asc"
+        ;;
+    esac
+  fi
+
   if [[ $HAS_USAGE -eq 1 ]]; then
     # join mem usage then cpu usage, then print
     awk -F'\t' 'FNR==NR{um[$1"/"$2]=$3; next} {print $0 "\t" (um[$1"/"$2]?um[$1"/"$2]:"0.00") }' \
         "$USAGE_MEM_TSV" <(printf "%s\n" "$PER_POD_FOR_PRINT") \
     | awk -F'\t' 'FNR==NR{uc[$1"/"$2]=$3; next} {print $0 "\t" (uc[$1"/"$2]?uc[$1"/"$2]:"0.000") }' \
         "$USAGE_CPU_TSV" - \
-    | awk -v show_limits="$SHOW_LIMITS" -v limit="$LIMIT_LINES" -F'\t' '
+    | awk -v show_limits="$SHOW_LIMITS" -v limit="$LIMIT_LINES" -v sortcol="$DEBUG_SORT_COLUMN" -F'	' '
         NF{
-          ns=$1; pod=$2; node=$3; rmem=$4; lmem=$5; rcpu=$6; lcpu=$7; umem=$8; ucpu=$9;
-          printf "  %-60s %-9.2f", ns"/"pod, rmem;      # REQ_MEM
-          printf " | %-11.2f", umem;                    # USAGE_MEM
-          if (show_limits==1) printf " | %-10.2f", lmem;# LIM_MEM
-          printf " | %-6.3f", rcpu;                     # REQ_CPU
-          printf " | %-8.3f", ucpu;                     # USAGE_CPU
-          if (show_limits==1) printf " | %-6.3f", lcpu; # LIM_CPU
-          printf "  [%-s]\n", node;
+          ns=$1; pod=$2; node=$3; rmem=$4+0; lmem=$5+0; rcpu=$6+0; lcpu=$7+0; umem=$8+0; ucpu=$9+0;
+          name = ns"/"pod;
+
+          line = sprintf("  %-60s %-9.2f | %-11.2f", name, rmem, umem);
+          if (show_limits==1) line = line sprintf(" | %-10.2f", lmem);
+          line = line sprintf(" | %-6.3f | %-8.3f", rcpu, ucpu);
+          if (show_limits==1) line = line sprintf(" | %-6.3f", lcpu);
+          line = line sprintf("  [%-s]", node);
+
+          sortKey = name;
+          if      (sortcol=="NAME")      sortKey = name;
+          else if (sortcol=="NODE")      sortKey = node;
+          else if (sortcol=="REQ_MEM")   sortKey = rmem;
+          else if (sortcol=="USAGE_MEM") sortKey = umem;
+          else if (sortcol=="LIM_MEM")   sortKey = lmem;
+          else if (sortcol=="REQ_CPU")   sortKey = rcpu;
+          else if (sortcol=="USAGE_CPU") sortKey = ucpu;
+          else if (sortcol=="LIM_CPU")   sortKey = lcpu;
+
+          printf "%s\t%s\n", sortKey, line;
           if(++c>=limit) exit
         }' \
-    | sort -k1,1 -k2,2nr
+    | { if [[ "$DEBUG_SORT_MODE" == "str_asc" ]]; then sort -k1,1; else sort -k1,1nr; fi; } \
+    | cut -f2-
   else
     printf "%s\n" "$PER_POD_FOR_PRINT" \
-    | awk -v show_limits="$SHOW_LIMITS" -v max="$LIMIT_LINES" -F'\t' '
+    | awk -v show_limits="$SHOW_LIMITS" -v max="$LIMIT_LINES" -v sortcol="$DEBUG_SORT_COLUMN" -F'	' '
         NF{
-          ns=$1; pod=$2; node=$3; rmem=$4; lmem=$5; rcpu=$6; lcpu=$7;
-          printf "  %-60s %-9.2f", ns"/"pod, rmem;
-          if (show_limits==1) printf " | %-10.2f", lmem;
-          printf " | %-6.3f", rcpu;
-          if (show_limits==1) printf " | %-6.3f", lcpu;
-          printf "  [%-s]\n", node;
+          ns=$1; pod=$2; node=$3; rmem=$4+0; lmem=$5+0; rcpu=$6+0; lcpu=$7+0;
+          name = ns"/"pod;
+
+          line = sprintf("  %-60s %-9.2f", name, rmem);
+          if (show_limits==1) line = line sprintf(" | %-10.2f", lmem);
+          line = line sprintf(" | %-6.3f", rcpu);
+          if (show_limits==1) line = line sprintf(" | %-6.3f", lcpu);
+          line = line sprintf("  [%-s]", node);
+
+          sortKey = name;
+          if      (sortcol=="NAME")    sortKey = name;
+          else if (sortcol=="NODE")    sortKey = node;
+          else if (sortcol=="REQ_MEM") sortKey = rmem;
+          else if (sortcol=="LIM_MEM") sortKey = lmem;
+          else if (sortcol=="REQ_CPU") sortKey = rcpu;
+          else if (sortcol=="LIM_CPU") sortKey = lcpu;
+
+          printf "%s\t%s\n", sortKey, line;
           if(++c>=max) exit
         }' \
-    | sort -k1,1 -k2,2nr
+    | { if [[ "$DEBUG_SORT_MODE" == "str_asc" ]]; then sort -k1,1; else sort -k1,1nr; fi; } \
+    | cut -f2-
   fi
 
   echo "--------------------------------------------------"
@@ -692,7 +763,7 @@ fi
 
 if [[ $HAS_USAGE -eq 0 ]]; then
   case "$SORT_COLUMN" in
-    USED%|USAGEGI|CPU_USED%|CPU_USE|CPU_BOOKED%)
+    USED%|USAGEGI|CPU_USED%|CPU_USE)
       echo "WARN: --sort-column $SORT_COLUMN requested, but no usage metrics collected; sorting by NODE instead." >&2
       SORT_COLUMN="NODE"
       ;;
@@ -840,23 +911,57 @@ function colorpct(p,w,   col,s,pad){
       #   cPctS = CPU USED%     (usage vs capacity)
       # and 'node' variable with node name
 
-      # Decide sort key based on sort_column (always raw fields; never colorized strings)
-      sortKey = node
-      if      (sort_column == "ALLOCGI")      sortKey = aGi;
-      else if (sort_column == "BOOKEDGI")     sortKey = bGi;
-      else if (sort_column == "BOOKED%")      sortKey = bPct;
-      else if (sort_column == "USAGEGI")      sortKey = uGi;
-      else if (sort_column == "USED%")        sortKey = uPct;
-      else if (sort_column == "CPU_ALLOC")    sortKey = cAlloc;
-      else if (sort_column == "CPU_BOOK")     sortKey = cBook;
-      else if (sort_column == "CPU_BOOKED%")  sortKey = cBookPct;
-      else if (sort_column == "CPU_USE")      sortKey = cUse;
-      else if (sort_column == "CPU_USED%")    sortKey = cPct;
-      else if (sort_column == "CPU_CORES")    sortKey = cores;
-      else if (sort_column == "CAPACITY_GI")  sortKey = capGi;
-      else if (sort_column == "NODE")         sortKey = node;
-      else if (sort_column == "ROLES")        sortKey = role;
+      # Decide sort key based on sort_column (ALWAYS use raw fields; never colorized strings)
+
+
+      sortKey = node;
+
+
+      if      (sort_column == "NODE")         sortKey = node;
+
+
       else if (sort_column == "STATUS")       sortKey = status;
+
+
+      else if (sort_column == "ROLES")        sortKey = role;
+
+
+      else if (sort_column == "ALLOCGI")      sortKey = aGi;
+
+
+      else if (sort_column == "BOOKEDGI")     sortKey = bGi;
+
+
+      else if (sort_column == "BOOKED%")      sortKey = bPct;
+
+
+      else if (sort_column == "USAGEGI")      sortKey = uGi;
+
+
+      else if (sort_column == "USED%")        sortKey = uPct;
+
+
+      else if (sort_column == "CPU_ALLOC")    sortKey = cAlloc;
+
+
+      else if (sort_column == "CPU_BOOK")     sortKey = cBook;
+
+
+      else if (sort_column == "CPU_BOOKED%")  sortKey = cBookPct;
+
+
+      else if (sort_column == "CPU_USE")      sortKey = cUse;
+
+
+      else if (sort_column == "CPU_USED%")    sortKey = cPct;
+
+
+      else if (sort_column == "CPU_CORES")    sortKey = cores;
+
+
+      else if (sort_column == "CAPACITY_GI")  sortKey = capGi;
+
+
       printf "%s\t%s\n", sortKey, line;
 
 
@@ -885,19 +990,14 @@ else
         line = line sprintf(" %-10.0f %-12.2f", cores, capGi);
       }
 
-      # Decide sort key (no-usage case): allow sorting on any non-usage column
+      # Decide sort key (in no-usage case, only NODE or BOOKED% make sense)
       sortKey = node;
-      if      (sort_column == "ALLOCGI")      sortKey = aGi;
-      else if (sort_column == "BOOKEDGI")     sortKey = bGi;
-      else if (sort_column == "BOOKED%")      sortKey = bPct;
-      else if (sort_column == "CPU_ALLOC")    sortKey = cAlloc;
-      else if (sort_column == "CPU_BOOK")     sortKey = cBook;
-      else if (sort_column == "CPU_BOOKED%")  sortKey = cBookPct;
-      else if (sort_column == "CPU_CORES")    sortKey = cores;
-      else if (sort_column == "CAPACITY_GI")  sortKey = capGi;
-      else if (sort_column == "NODE")         sortKey = node;
-      else if (sort_column == "ROLES")        sortKey = role;
-      else if (sort_column == "STATUS")       sortKey = status;
+      if (sort_column == "BOOKED%")
+        sortKey = bPct;
+      else if (sort_column == "NODE")
+        sortKey = node;
+      else if (sort_column == "ROLES")
+        sortKey = role;
       printf "%s\t%s\n", sortKey, line;
     }' "$NODES_METRICS_TSV_FILE" \
   | { if [[ "$SORT_MODE" == "str_asc" ]]; then sort -k1,1; else sort -k1,1nr; fi; } \
