@@ -1,0 +1,143 @@
+diff --git a/.bashrc b/.bashrc
+--- a/.bashrc
++++ b/.bashrc
+@@ -117,3 +117,139 @@
+ fi
+ # export PATH="$HOME/bin:$PATH"
+ 
++# --- OpenShift Banner & Prompt (prefer context alias, safe) ---
++
++# Remember the last cluster we showed a banner for (per shell)
++_OC_LAST_BANNER_NAME=""
++_OC_FORCE_BANNER=0
++
++# Current context name (e.g., "osv", "osv-prd", or a generated name)
++_oc_current_context() {
++  command -v oc >/dev/null 2>&1 || return 0
++  command oc config current-context 2>/dev/null
++}
++
++# Raw cluster name from kubeconfig
++_oc_raw_cluster_name() {
++  command -v oc >/dev/null 2>&1 || return 0
++  local name
++  name=$(command oc config view --minify -o jsonpath='{.clusters[0].name}' 2>/dev/null)
++  [ -z "$name" ] && name="$(_oc_current_context)"
++  printf "%s" "$name"
++}
++
++# Clean host-style cluster names: drop api- prefix, :port, and -byu-edu tail
++_oc_clean_cluster_name() {
++  local raw="$(_oc_raw_cluster_name)" clean
++  [ -z "$raw" ] && return 0
++  clean="$raw"
++  clean="${clean#api-}"         # remove leading api-
++  clean="${clean%%:[0-9]*}"     # remove :<port>
++  clean="${clean%-byu-edu}"     # remove -byu-edu tail if present
++  printf "%s" "$clean"
++}
++
++# Preferred display name:
++# - If context is one of your aliases, show it (e.g., "osv", "osv-prd")
++# - Otherwise show the cleaned cluster name
++_oc_display_name() {
++  local ctx="$(_oc_current_context)"
++  case "$ctx" in
++    osv|osv-prd|osv-dev) printf "%s" "$ctx" ;;
++    *)                   _oc_clean_cluster_name ;;
++  esac
++}
++
++# Colors (banner_bg | prompt_fg)
++_oc_color_for() {
++  case "$1" in
++    *osv*|*prd*|*prod*)           printf "\033[1;41m|\[\e[1;31m\]" ;; # red
++    *stg*|*stage*|*test*)         printf "\033[1;43m|\[\e[1;33m\]" ;; # yellow
++    *dev*|*sandbox*|*sbx*)        printf "\033[1;42m|\[\e[1;32m\]" ;; # green
++    *)                            printf "\033[1;44m|\[\e[1;34m\]" ;; # blue (default)
++  esac
++}
++
++# Banner + prompt (PS1 color escapes wrapped in \[ \])
++# - Prints the banner only when the cluster changes (or when forced)
++# - Still updates the prompt every time it runs
++_oc_banner_and_prompt() {
++  local quiet=0
++  [[ "$1" == "--quiet" ]] && { quiet=1; shift; }
++
++  local name colors banner_bg prompt_fg RESET="\[\e[0m\]"
++  name="$(_oc_display_name)"; [ -z "$name" ] && return 0
++
++  colors="$(_oc_color_for "$name")"
++  banner_bg="${colors%%|*}"
++  prompt_fg="${colors#*|}"
++
++  # Banner (normal ANSI is fine here). Print only on change, or when forced.
++  if (( quiet )); then
++    # Initialize "last seen" without printing
++    _OC_LAST_BANNER_NAME="$name"
++    _OC_FORCE_BANNER=0
++  elif [[ "${_OC_FORCE_BANNER:-0}" == "1" || "$name" != "${_OC_LAST_BANNER_NAME:-}" ]]; then
++    printf "%b Connected to OpenShift cluster: %s \033[0m\n" "$banner_bg" "$name" >&2
++    _OC_LAST_BANNER_NAME="$name"
++    _OC_FORCE_BANNER=0
++  fi
++
++  # Prompt
++  if [[ $- == *i* ]]; then
++    PS1="${prompt_fg}[\$(_oc_display_name)]${RESET} \u@\h:\w\$ "
++    export PS1
++  fi
++}
++
++# Show prompt on shell start (interactive only). Use --quiet to suppress banner on shell start.
++case $- in *i* ) _oc_banner_and_prompt --quiet ;; esac
++
++# Safe oc wrapper:
++# - Preserves oc exit code
++# - Only forces a banner after login/logout or context switching
++oc() {
++  local subcmd="$1" subsub="$2"
++
++  command oc "$@"
++  local rc=$?
++
++  if [[ $- == *i* ]]; then
++    # Force a banner after commands that typically change auth/context
++    if [[ $rc -eq 0 ]]; then
++      case "$subcmd" in
++        login|logout) _OC_FORCE_BANNER=1 ;;
++        config)
++          case "$subsub" in
++            use-context|set-context|rename-context|delete-context) _OC_FORCE_BANNER=1 ;;
++          esac
++          ;;
++      esac
++    fi
++
++    _oc_banner_and_prompt
++  fi
++
++  return $rc
++}
++
++# --- OpenShift context pinning helper (Option A) ---
++# Use this after oc login to tie the fresh token to your short alias context.
++oc_pin_context() {
++  local alias="$1"
++  [ -z "$alias" ] && { echo "Usage: oc_pin_context <alias>"; return 2; }
++
++  local ctx cluster user
++  ctx=$(command oc config current-context 2>/dev/null) || return 1
++  cluster=$(command oc config view -o jsonpath='{.contexts[?(@.name=="'"$ctx"'")].context.cluster}')
++  user=$(command oc config view -o jsonpath='{.contexts[?(@.name=="'"$ctx"'")].context.user}')
++
++  [ -z "$cluster" -o -z "$user" ] && { echo "Could not resolve cluster/user for $ctx"; return 1; }
++
++  command oc config set-context "$alias" --cluster="$cluster" --user="$user" >/dev/null
++  command oc config use-context "$alias" >/dev/null
++  echo "Pinned current login to context \"$alias\"."
++
++  _OC_FORCE_BANNER=1
++  _oc_banner_and_prompt
++}

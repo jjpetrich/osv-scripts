@@ -1,0 +1,90 @@
+diff --git a/.bashrc b/.bashrc
+--- a/.bashrc
++++ b/.bashrc
+@@ -119,6 +119,10 @@
+ 
+ # --- OpenShift Banner & Prompt (prefer context alias, safe) ---
+ 
++# Remember the last cluster we showed a banner for (per shell)
++_OC_LAST_BANNER_NAME=""
++_OC_FORCE_BANNER=0
++
+ # Current context name (e.g., "osv", "osv-prd", or a generated name)
+ _oc_current_context() {
+   command -v oc >/dev/null 2>&1 || return 0
+@@ -168,6 +172,9 @@
+ 
+ # Banner + prompt (PS1 color escapes wrapped in \[ \])
+ _oc_banner_and_prompt() {
++  local quiet=0
++  [[ "$1" == "--quiet" ]] && { quiet=1; shift; }
++
+   local name colors banner_bg prompt_fg RESET="\[\e[0m\]"
+   name="$(_oc_display_name)"; [ -z "$name" ] && return 0
+ 
+@@ -175,8 +182,16 @@
+   banner_bg="${colors%%|*}"
+   prompt_fg="${colors#*|}"
+ 
+-  # Banner (normal ANSI is fine here)
+-  printf "%b Connected to OpenShift cluster: %s \033[0m\n" "$banner_bg" "$name" >&2
++  # Banner (normal ANSI is fine here). Print only on change, or when forced.
++  if (( quiet )); then
++    # Initialize "last seen" without printing
++    _OC_LAST_BANNER_NAME="$name"
++    _OC_FORCE_BANNER=0
++  elif [[ "${_OC_FORCE_BANNER:-0}" == "1" || "$name" != "${_OC_LAST_BANNER_NAME:-}" ]]; then
++    printf "%b Connected to OpenShift cluster: %s \033[0m\n" "$banner_bg" "$name" >&2
++    _OC_LAST_BANNER_NAME="$name"
++    _OC_FORCE_BANNER=0
++  fi
+ 
+   # Prompt
+   if [[ $- == *i* ]]; then
+@@ -185,13 +200,33 @@
+   fi
+ }
+ 
+-# Show on shell start (interactive only)
+-case $- in *i* ) _oc_banner_and_prompt ;; esac
++# Show prompt on shell start (interactive only). Use --quiet to suppress banner on shell start.
++case $- in *i* ) _oc_banner_and_prompt --quiet ;; esac
+ 
+ # Safe oc wrapper: call real oc, then refresh banner/prompt
+ oc() {
++  local subcmd="$1" subsub="$2"
++
+   command oc "$@"
+-  [[ $- == *i* ]] && _oc_banner_and_prompt
++  local rc=$?
++
++  if [[ $- == *i* ]]; then
++    # Force a banner after commands that typically change auth/context
++    if [[ $rc -eq 0 ]]; then
++      case "$subcmd" in
++        login|logout) _OC_FORCE_BANNER=1 ;;
++        config)
++          case "$subsub" in
++            use-context|set-context|rename-context|delete-context) _OC_FORCE_BANNER=1 ;;
++          esac
++          ;;
++      esac
++    fi
++
++    _oc_banner_and_prompt
++  fi
++
++  return $rc
+ }
+ # --- OpenShift context pinning helper (Option A) ---
+ # Use this after oc login to tie the fresh token to your short alias context.
+@@ -210,6 +245,9 @@
+   command oc config set-context "$alias" --cluster="$cluster" --user="$user" >/dev/null
+   command oc config use-context "$alias" >/dev/null
+   echo "Pinned current login to context \"$alias\"."
++
++  _OC_FORCE_BANNER=1
++  _oc_banner_and_prompt
+ }
+ export BROWSER=wslview
+ 

@@ -221,10 +221,11 @@ while [[ $# -gt 0 ]]; do
   esac
 done
 
-# If a node filter is requested, force debug + untruncated per-pod list
+# If a node filter is requested, force debug + untruncated per-pod list + Node-scope-main
 if [[ -n "$NODE_FILTER" ]]; then
   DEBUG=1
   DEBUG_ALL_PODS=1
+  NODE_SCOPE_MAIN=1
 fi
 
 # ------------------------ SANITY CHECKS ------------------------
