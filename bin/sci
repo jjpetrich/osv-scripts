@@ -49,7 +49,7 @@ OPTIONS
                            (default: on)
   --include-controllers    Include control-plane/master nodes in the main tables
                            (default: only workers)
-  --sort-col COL        Sort main table by COL: NODE, BOOKED%, USED%, CPU_BOOKED%, CPU_USED%
+  --sort-col COL        Sort main table by COL (case-insensitive): NODE, STATUS, ROLES, ALLOCGi, BOOKEDGi, BOOKED%, USAGEGi, USED%, CPU_ALLOC, CPU_BOOK, CPU_BOOKED%, CPU_USE, CPU_USED%, CPU_CORES, CAPACITY_Gi
                            (default: NODE)
   --version                Print version and cluster info
   -h, --help, help         Show this help
@@ -112,7 +112,8 @@ INCLUDE_CONTROLLERS=0
 SORT_COLUMN="NODE"
 
 # ---------------- Sortable Columns (for --sort-col) ----------------
-# Canonical, case-insensitive column names that can be used with --sort-col.
+# Canonical, case-insensitive column reminder for --sort-col.
+# Note: Some columns only appear when the corresponding data is present.
 declare -A SORT_COL_MAP=(
   [NODE]=1
   [STATUS]=1
@@ -157,6 +158,19 @@ while [[ $# -gt 0 ]]; do
     --sort-col)
       val="${2:-}"
       key="$(printf '%s' "$val" | tr '[:lower:]' '[:upper:]')"
+      key="${key//-/_}"
+      key="${key// /}"
+
+      # Back-compat aliases
+      case "$key" in
+        B|BOOKED) key="BOOKED%" ;;
+        U|USED) key="USED%" ;;
+        CPU_BOOKED) key="CPU_BOOKED%" ;;
+        CPU_USED) key="CPU_USED%" ;;
+        CPU%) key="CPU_USED%" ;;
+        CAPACITYGI) key="CAPACITY_GI" ;;
+      esac
+
       if [[ -z "${SORT_COL_MAP[$key]:-}" ]]; then
         echo "ERROR: Invalid --sort-col '$val'" >&2
         echo "Valid columns:" >&2
@@ -164,6 +178,7 @@ while [[ $# -gt 0 ]]; do
 ' "${!SORT_COL_MAP[@]}" | sort | sed 's/^/  /' >&2
         exit 1
       fi
+
       SORT_COLUMN="$key"
       shift 2 ;;
     --version) print_version; exit 0 ;;
@@ -677,7 +692,7 @@ fi
 
 if [[ $HAS_USAGE -eq 0 ]]; then
   case "$SORT_COLUMN" in
-    USED%|USAGEGI|CPU_USED%|CPU_USE)
+    USED%|USAGEGI|CPU_USED%|CPU_USE|CPU_BOOKED%)
       echo "WARN: --sort-column $SORT_COLUMN requested, but no usage metrics collected; sorting by NODE instead." >&2
       SORT_COLUMN="NODE"
       ;;
@@ -720,7 +735,7 @@ RST=$'\033[0m'
 
 # Decide sort mode for main table
 SORT_MODE="num_desc"
-if [[ "$SORT_COLUMN" == "NODE" || "$SORT_COLUMN" == "ROLES" ]]; then
+if [[ "$SORT_COLUMN" == "NODE" || "$SORT_COLUMN" == "ROLES" || "$SORT_COLUMN" == "STATUS" ]]; then
   SORT_MODE="str_asc"
 fi
 
@@ -825,19 +840,28 @@ function colorpct(p,w,   col,s,pad){
       #   cPctS = CPU USED%     (usage vs capacity)
       # and 'node' variable with node name
 
-      # Decide sort key based on sort_column
+      # Decide sort key based on sort_column (always raw fields; never colorized strings)
       sortKey = node
-      if      (sort_column == "BOOKED%")     sortKey = bPct;
-      else if (sort_column == "USED%")       sortKey = uPct;
-      else if (sort_column == "CPU_BOOKED%") sortKey = cBookPctS;
-      else if (sort_column == "CPU_USED%")   sortKey = cPctS;
-      else if (sort_column == "NODE")        sortKey = node;
-      else if (sort_column == "ROLES")       sortKey = role;
+      if      (sort_column == "ALLOCGI")      sortKey = aGi;
+      else if (sort_column == "BOOKEDGI")     sortKey = bGi;
+      else if (sort_column == "BOOKED%")      sortKey = bPct;
+      else if (sort_column == "USAGEGI")      sortKey = uGi;
+      else if (sort_column == "USED%")        sortKey = uPct;
+      else if (sort_column == "CPU_ALLOC")    sortKey = cAlloc;
+      else if (sort_column == "CPU_BOOK")     sortKey = cBook;
+      else if (sort_column == "CPU_BOOKED%")  sortKey = cBookPct;
+      else if (sort_column == "CPU_USE")      sortKey = cUse;
+      else if (sort_column == "CPU_USED%")    sortKey = cPct;
+      else if (sort_column == "CPU_CORES")    sortKey = cores;
+      else if (sort_column == "CAPACITY_GI")  sortKey = capGi;
+      else if (sort_column == "NODE")         sortKey = node;
+      else if (sort_column == "ROLES")        sortKey = role;
+      else if (sort_column == "STATUS")       sortKey = status;
       printf "%s\t%s\n", sortKey, line;
 
 
     }' "$NODES_METRICS_TSV_FILE" \
-  | sort -k1,1nr | cut -f2-
+  | { if [[ "$SORT_MODE" == "str_asc" ]]; then sort -k1,1; else sort -k1,1nr; fi; } | cut -f2-
 else
   # No usage present at all: simpler print, no colors
   awk -F'\t' \
@@ -861,14 +885,19 @@ else
         line = line sprintf(" %-10.0f %-12.2f", cores, capGi);
       }
 
-      # Decide sort key (in no-usage case, only NODE or BOOKED% make sense)
+      # Decide sort key (no-usage case): allow sorting on any non-usage column
       sortKey = node;
-      if (sort_column == "BOOKED%")
-        sortKey = bPct;
-      else if (sort_column == "NODE")
-        sortKey = node;
-      else if (sort_column == "ROLES")
-        sortKey = role;
+      if      (sort_column == "ALLOCGI")      sortKey = aGi;
+      else if (sort_column == "BOOKEDGI")     sortKey = bGi;
+      else if (sort_column == "BOOKED%")      sortKey = bPct;
+      else if (sort_column == "CPU_ALLOC")    sortKey = cAlloc;
+      else if (sort_column == "CPU_BOOK")     sortKey = cBook;
+      else if (sort_column == "CPU_BOOKED%")  sortKey = cBookPct;
+      else if (sort_column == "CPU_CORES")    sortKey = cores;
+      else if (sort_column == "CAPACITY_GI")  sortKey = capGi;
+      else if (sort_column == "NODE")         sortKey = node;
+      else if (sort_column == "ROLES")        sortKey = role;
+      else if (sort_column == "STATUS")       sortKey = status;
       printf "%s\t%s\n", sortKey, line;
     }' "$NODES_METRICS_TSV_FILE" \
   | { if [[ "$SORT_MODE" == "str_asc" ]]; then sort -k1,1; else sort -k1,1nr; fi; } \
