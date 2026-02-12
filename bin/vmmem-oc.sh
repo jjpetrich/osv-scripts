@@ -2,23 +2,36 @@
 set -euo pipefail
 
 #
-# v2: VM RAM allocation vs usage (KubeVirt) using oc / oc adm
+# vmmem-oc.sh (v2 full replacement)
 #
-# Improvements vs v1:
-#  - MEMORY column detected dynamically from `oc adm top pod` header (no hard-coded $4)
-#  - virt-launcher pod -> VM/VMI name resolved via pod labels (prefers kubevirt.io/domain)
-#  - doesn't drop VMIs if metrics are missing (shows METRICS=no)
-#  - quantity parser supports Ti in addition to Gi/Mi/Ki/etc
+# Purpose:
+#   Show KubeVirt VMI allocated memory (from VMI spec) vs actual virt-launcher pod memory usage
+#   (from `oc adm top pod`) for Running VMIs.
+#
+# Robustness improvements:
+#   - MEMORY column detected dynamically (no hard-coded $4)
+#   - virt-launcher pod -> VMI name resolved via:
+#       1) pod ownerReferences kind=VirtualMachineInstance (most robust)
+#       2) pod label kubevirt.io/domain (common)
+#       3) heuristic from pod name (last resort)
+#   - Does NOT drop VMIs when metrics are missing: prints USED=0 and METRICS=no
+#   - Quantity parser supports Ti/T, Gi/G, Mi/M, Ki/K, and raw bytes
 #
 # Filters:
-#   --percent-used <N>     (show only VMs with pct_used <= N)
-#   --min-alloc-mem <GiB>  (show only VMs with allocated RAM >= GiB)
+#   --percent-used N / -p N    => keep rows where pct_used <= N
+#   --min-alloc-mem GiB / -m   => keep rows where alloc_gib >= GiB
 #
-# Limit results:
-#   TOP_N=30 ./vmmem-oc-v2.sh
+# Output sorting:
+#   alloc_gib desc, then pct_used asc
+#
+# Optional:
+#   TOP_N=30      => show only first N rows after sorting
+#   DEBUG=1       => keep temp files and print their paths
 #
 
 TOP_N="${TOP_N:-}"
+DEBUG="${DEBUG:-0}"
+
 PCT_THRESH=""
 MIN_ALLOC_GIB=""
 
@@ -28,10 +41,10 @@ Usage: $0 [--percent-used N] [--min-alloc-mem GiB]
 
 Options:
   --percent-used N, -p N
-        Only show VMs using <= N percent of allocated RAM.
+        Only show VMIs with pct_used <= N.
 
   --min-alloc-mem GiB, -m GiB
-        Only show VMs whose allocated RAM is >= GiB.
+        Only show VMIs with alloc_gib >= GiB.
 
   -h, --help
         Show help.
@@ -39,6 +52,9 @@ Options:
 Environment:
   TOP_N=N
         Show only the first N sorted results.
+
+  DEBUG=1
+        Keep temp files and print their location.
 EOF
 }
 
@@ -51,11 +67,11 @@ while [[ $# -gt 0 ]]; do
   esac
 done
 
-if [[ -n "$PCT_THRESH" && ! "$PCT_THRESH" =~ ^[0-9]+([.][0-9]+)?$ ]]; then
+if [[ -n "${PCT_THRESH}" && ! "${PCT_THRESH}" =~ ^[0-9]+([.][0-9]+)?$ ]]; then
   echo "ERROR: --percent-used requires a numeric value." >&2
   exit 1
 fi
-if [[ -n "$MIN_ALLOC_GIB" && ! "$MIN_ALLOC_GIB" =~ ^[0-9]+([.][0-9]+)?$ ]]; then
+if [[ -n "${MIN_ALLOC_GIB}" && ! "${MIN_ALLOC_GIB}" =~ ^[0-9]+([.][0-9]+)?$ ]]; then
   echo "ERROR: --min-alloc-mem requires a numeric GiB value." >&2
   exit 1
 fi
@@ -68,6 +84,8 @@ require_bin() {
     }
   done
 }
+
+require_bin oc jq awk sort join column mktemp
 
 # Kubernetes-ish quantity -> MiB
 quantity_to_mi_awk='
@@ -91,24 +109,29 @@ function toMi(q, v) {
 }
 '
 
-require_bin oc jq awk sort join column
-
 tmpdir="$(mktemp -d)"
-trap 'rm -rf "$tmpdir"' EXIT
+cleanup() {
+  if [[ "${DEBUG}" == "1" ]]; then
+    echo "# DEBUG=1: temp files kept in: ${tmpdir}" >&2
+  else
+    rm -rf "${tmpdir}"
+  fi
+}
+trap cleanup EXIT
 
-vmi_raw="${tmpdir}/vmi_raw.tsv"
-vmi_alloc="${tmpdir}/vmi_alloc.tsv"
+# Temp files
+vmi_raw="${tmpdir}/vmi_raw.tsv"                 # ns  name  node  memQty
+vmi_alloc="${tmpdir}/vmi_alloc.tsv"             # key(ns|vmi) allocMi ns name node
 
-podmap_raw="${tmpdir}/podmap_raw.tsv"      # ns \t pod \t domain(label) \t fallbackVm
-top_raw="${tmpdir}/top_raw.tsv"            # ns \t pod \t memQty
-top_used_by_pod="${tmpdir}/top_used_by_pod.tsv"   # ns|pod \t usedMi
-pod_to_vm_used="${tmpdir}/pod_to_vm_used.tsv"     # ns|vm \t usedMi \t hasMetrics(1)
+podmap_raw="${tmpdir}/podmap_raw.tsv"           # key(ns|pod) vmiNameResolved
+top_raw="${tmpdir}/top_raw.tsv"                 # ns pod memQty
+top_used_by_pod="${tmpdir}/top_used_by_pod.tsv" # key(ns|pod) usedMi
 
+pod_to_vmi_used="${tmpdir}/pod_to_vmi_used.tsv" # key(ns|vmi) usedMi hasMetrics(1)
 joined="${tmpdir}/joined.tsv"
 
 echo "# Collecting VMI info (allocated memory + node)..." >&2
 
-# namespace, name, node, memQty
 oc get vmi -A -o json \
   | jq -r '
       .items[]
@@ -126,7 +149,6 @@ oc get vmi -A -o json \
       | @tsv
     ' > "${vmi_raw}"
 
-# Convert alloc to Mi; key = ns|name
 awk -F'\t' "${quantity_to_mi_awk}
   NF >= 4 {
     ns   = \$1
@@ -139,11 +161,12 @@ awk -F'\t' "${quantity_to_mi_awk}
   }
 " "${vmi_raw}" > "${vmi_alloc}"
 
-echo "# Collecting virt-launcher pod -> VM mapping (labels)..." >&2
+echo "# Collecting virt-launcher pod -> VMI mapping (ownerRefs/labels/fallback)..." >&2
 
-# Build map keyed by ns|pod.
-# Prefer kubevirt.io/domain label (you observed it's present).
-# Keep a fallback heuristic VM name too, just in case.
+# Map pod -> VMI name:
+#  1) ownerReferences kind=VirtualMachineInstance (best)
+#  2) label kubevirt.io/domain
+#  3) heuristic from pod name
 oc get pod -A -l kubevirt.io=virt-launcher -o json \
   | jq -r '
       .items[]
@@ -152,28 +175,38 @@ oc get pod -A -l kubevirt.io=virt-launcher -o json \
           $m.namespace,
           $m.name,
           ($m.labels["kubevirt.io/domain"] // ""),
-          $m.name
+          (
+            ($m.ownerReferences // [])
+            | map(select(.kind=="VirtualMachineInstance"))
+            | .[0].name
+            // ""
+          )
         ]
       | @tsv
     ' \
   | awk -F'\t' '
       {
-        ns=$1; pod=$2; domain=$3; fb=$4;
+        ns=$1; pod=$2; domain=$3; ownerVmi=$4;
 
-        # fallback heuristic: strip virt-launcher- prefix and trailing -<suffix>
-        vm=fb
-        sub(/^virt-launcher-/, "", vm)
-        sub(/-[^-]+$/, "", vm)
+        # heuristic fallback from pod name
+        hv=pod
+        sub(/^virt-launcher-/, "", hv)
+        sub(/-[^-]+$/, "", hv)
 
+        vmi = (ownerVmi != "" ? ownerVmi : (domain != "" ? domain : hv))
         key = ns "|" pod
-        print key "\t" domain "\t" vm
+        print key "\t" vmi
       }
     ' > "${podmap_raw}"
 
 echo "# Collecting memory usage from oc adm top pod..." >&2
 
-# Parse top output robustly by discovering column indices from header.
-oc adm top pod -A --selector kubevirt.io=virt-launcher 2>/dev/null \
+# Always create these files so later steps won't crash
+: > "${top_raw}"
+: > "${top_used_by_pod}"
+
+# Parse top output robustly; if it fails, proceed with empty metrics (METRICS=no)
+if ! oc adm top pod -A --selector kubevirt.io=virt-launcher 2>/dev/null \
   | awk '
       NR==1 {
         for (i=1; i<=NF; i++) {
@@ -182,20 +215,21 @@ oc adm top pod -A --selector kubevirt.io=virt-launcher 2>/dev/null \
           else if ($i ~ /^MEMORY/) memcol=i
         }
         if (!nscol || !namecol || !memcol) {
-          print "ERROR: Could not find NAMESPACE/NAME/MEMORY columns in oc adm top output" > "/dev/stderr"
-          exit 1
+          print "WARN: Could not detect NAMESPACE/NAME/MEMORY columns in oc adm top output" > "/dev/stderr"
+          exit 2
         }
         next
       }
-      NF>=1 {
-        ns  = $nscol
-        pod = $namecol
-        mem = $memcol
-        if (ns != "" && pod != "" && mem != "") print ns "\t" pod "\t" mem
+      {
+        ns=$nscol; pod=$namecol; mem=$memcol
+        if (ns!="" && pod!="" && mem!="") print ns "\t" pod "\t" mem
       }
     ' > "${top_raw}"
+then
+  echo "WARN: oc adm top pod produced no parsable data; METRICS will be 'no'." >&2
+  : > "${top_raw}"
+fi
 
-# Convert to MiB, keyed by ns|pod (top output is already per-pod)
 awk -F'\t' "${quantity_to_mi_awk}
   NF >= 3 {
     ns=\$1; pod=\$2; qty=\$3
@@ -205,44 +239,40 @@ awk -F'\t' "${quantity_to_mi_awk}
   }
 " "${top_raw}" > "${top_used_by_pod}"
 
-# Join podmap (ns|pod -> domain, fallbackVm) with top usage (ns|pod -> usedMi)
+# Join pod->vmi with pod->usedMi => vmi->usedMi
 LC_ALL=C sort -t $'\t' -o "${podmap_raw}" "${podmap_raw}"
 LC_ALL=C sort -t $'\t' -o "${top_used_by_pod}" "${top_used_by_pod}"
 
 join -t $'\t' -j 1 "${podmap_raw}" "${top_used_by_pod}" \
   | awk -F'\t' '
       {
-        # join output:
-        # $1=ns|pod, $2=domain, $3=fallbackVm, $4=usedMi
+        # $1 = ns|pod
+        # $2 = vmi
+        # $3 = usedMi
         split($1, a, "|"); ns=a[1]
-        domain=$2
-        fbvm=$3
-        usedMi=$4
+        vmi=$2
+        usedMi=$3 + 0
 
-        vm = (domain != "" ? domain : fbvm)
-        key = ns "|" vm
+        if (vmi == "") next
+        key = ns "|" vmi
 
-        # If somehow multiple pods map to same vm, keep the max usage (safer than sum)
+        # If multiple pods map to same VMI, keep max usage (safer default)
         if (!(key in max) || usedMi > max[key]) max[key]=usedMi
       }
       END {
-        for (k in max) {
-          printf "%s\t%.3f\t1\n", k, max[k]  # hasMetrics=1
-        }
+        for (k in max) printf "%s\t%.3f\t1\n", k, max[k]
       }
-    ' > "${pod_to_vm_used}"
+    ' > "${pod_to_vmi_used}"
 
-# ---------- join alloc + used (keep alloc even if no metrics) ----------
-
+# Join allocation + usage (keep alloc even if metrics missing)
 LC_ALL=C sort -t $'\t' -o "${vmi_alloc}" "${vmi_alloc}"
-LC_ALL=C sort -t $'\t' -o "${pod_to_vm_used}" "${pod_to_vm_used}"
+LC_ALL=C sort -t $'\t' -o "${pod_to_vmi_used}" "${pod_to_vmi_used}"
 
-# vmi_alloc: key, allocMi, ns, name, node
-# pod_to_vm_used: key, usedMi, hasMetrics
+# vmi_alloc: key allocMi ns name node
+# pod_to_vmi_used: key usedMi hasMetrics
 join -t $'\t' -a 1 -e 0 -o '1.1 1.2 1.3 1.4 1.5 2.2 2.3' \
-  "${vmi_alloc}" "${pod_to_vm_used}" \
+  "${vmi_alloc}" "${pod_to_vmi_used}" \
   | awk -F'\t' -v pct_thresh="${PCT_THRESH:-}" -v min_alloc="${MIN_ALLOC_GIB:-}" '
-      BEGIN { }
       {
         allocMi = $2 + 0
         ns      = $3
@@ -260,20 +290,32 @@ join -t $'\t' -a 1 -e 0 -o '1.1 1.2 1.3 1.4 1.5 2.2 2.3' \
 
         metrics = (has > 0 ? "yes" : "no")
 
-        printf "%s\t%s\t%s\t%8.2f\t%8.2f\t%8.2f\t%s\n",
+        printf "%-44s\t%-15s\t%-18s\t%8.2f\t%8.2f\t%8.2f\t%s\n",
                name, ns, node, allocGi, usedGi, pct, metrics
       }
     ' > "${joined}"
 
 echo
-echo "NAME                                          NAMESPACE         NODE                 ALLOC_GiB  USED_GiB  %_USED METRICS"
+echo "NAME                                         NAMESPACE        NODE                ALLOC_GiB  USED_GiB   %_USED  METRICS"
 echo "------------------------------------------------------------------------------------------------------------------------"
 
-if [[ -n "$TOP_N" ]]; then
+if [[ -n "${TOP_N}" ]]; then
   LC_ALL=C sort -t $'\t' -k4,4nr -k6,6n "${joined}" \
-    | head -n "$TOP_N" \
+    | head -n "${TOP_N}" \
     | column -t -s $'\t'
 else
   LC_ALL=C sort -t $'\t' -k4,4nr -k6,6n "${joined}" \
     | column -t -s $'\t'
+fi
+
+if [[ "${DEBUG}" == "1" ]]; then
+  echo >&2
+  echo "# DEBUG files:" >&2
+  echo "#   ${vmi_raw}" >&2
+  echo "#   ${vmi_alloc}" >&2
+  echo "#   ${podmap_raw}" >&2
+  echo "#   ${top_raw}" >&2
+  echo "#   ${top_used_by_pod}" >&2
+  echo "#   ${pod_to_vmi_used}" >&2
+  echo "#   ${joined}" >&2
 fi
