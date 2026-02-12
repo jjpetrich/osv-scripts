@@ -41,7 +41,7 @@ oc login --web: banner prints once right after login
 
 oc config use-context othercluster: banner prints once
 
-oc_pin_context ...: banner prints once (I updated that helper too)
+oc_pin_context ...: banner prints once
 
 Quick note about “clean .bashrc” portability
 
@@ -49,8 +49,7 @@ The “add” patch inserts the OpenShift block right after the standard line:
 
 # export PATH="$HOME/bin:$PATH"
 
-
-That’s present in the default Ubuntu/Debian-ish .bashrc skeleton (like the one your file is based on). If someone’s .bashrc is wildly different, the patch may not apply cleanly — 
+That’s present in the default Ubuntu/Debian-ish .bashrc skeleton. If your .bashrc is wildly different, the patch may not apply cleanly — 
 but in that case, the OpenShift block in the patch can still be copied in verbatim.
 
 Once your patch is in place you can edit your .bashrc manually and change the following section:
@@ -69,8 +68,3 @@ oc config use-context command.
 
 example: 
 instead of needing to type 'oc config use-context default/api-ocp-byu-edu:6443/jjpetric@byu.edu', you could simply type 'oc config use-context ocp' and it would work.
-
-
-
-
-
