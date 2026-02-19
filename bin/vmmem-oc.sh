@@ -1,45 +1,21 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-#
-# vmmem-oc.sh (v2 full replacement)
-#
-# Purpose:
-#   Show KubeVirt VMI allocated memory (from VMI spec) vs actual virt-launcher pod memory usage
-#   (from `oc adm top pod`) for Running VMIs.
-#
-# Robustness improvements:
-#   - MEMORY column detected dynamically (no hard-coded $4)
-#   - virt-launcher pod -> VMI name resolved via:
-#       1) pod ownerReferences kind=VirtualMachineInstance (most robust)
-#       2) pod label kubevirt.io/domain (common)
-#       3) heuristic from pod name (last resort)
-#   - Does NOT drop VMIs when metrics are missing: prints USED=0 and METRICS=no
-#   - Quantity parser supports Ti/T, Gi/G, Mi/M, Ki/K, and raw bytes
-#
-# Filters:
-#   --percent-used N / -p N    => keep rows where pct_used <= N
-#   --min-alloc-mem GiB / -m   => keep rows where alloc_gib >= GiB
-#
-# Output sorting:
-#   alloc_gib desc, then pct_used asc
-#
-# Optional:
-#   TOP_N=30      => show only first N rows after sorting
-#   DEBUG=1       => keep temp files and print their paths
-#
-
 TOP_N="${TOP_N:-}"
 DEBUG="${DEBUG:-0}"
 
 PCT_THRESH=""
 MIN_ALLOC_GIB=""
+NS_FILTER=""
 
 print_help() {
   cat <<EOF
-Usage: $0 [--percent-used N] [--min-alloc-mem GiB]
+Usage: $0 [options]
 
 Options:
+  --namespace NS, -n NS
+        Only include results from the given namespace.
+
   --percent-used N, -p N
         Only show VMIs with pct_used <= N.
 
@@ -62,6 +38,7 @@ while [[ $# -gt 0 ]]; do
   case "$1" in
     --percent-used|-p) PCT_THRESH="$2"; shift 2 ;;
     --min-alloc-mem|-m) MIN_ALLOC_GIB="$2"; shift 2 ;;
+    --namespace|-n) NS_FILTER="$2"; shift 2 ;;
     -h|--help) print_help; exit 0 ;;
     *) echo "ERROR: Unknown argument: $1" >&2; print_help >&2; exit 1 ;;
   esac
@@ -73,6 +50,10 @@ if [[ -n "${PCT_THRESH}" && ! "${PCT_THRESH}" =~ ^[0-9]+([.][0-9]+)?$ ]]; then
 fi
 if [[ -n "${MIN_ALLOC_GIB}" && ! "${MIN_ALLOC_GIB}" =~ ^[0-9]+([.][0-9]+)?$ ]]; then
   echo "ERROR: --min-alloc-mem requires a numeric GiB value." >&2
+  exit 1
+fi
+if [[ -n "${NS_FILTER}" && ! "${NS_FILTER}" =~ ^[a-z0-9]([-a-z0-9]*[a-z0-9])?$ ]]; then
+  echo "ERROR: --namespace must be a valid Kubernetes namespace (DNS label)." >&2
   exit 1
 fi
 
@@ -119,7 +100,6 @@ cleanup() {
 }
 trap cleanup EXIT
 
-# Temp files
 vmi_raw="${tmpdir}/vmi_raw.tsv"                 # ns  name  node  memQty
 vmi_alloc="${tmpdir}/vmi_alloc.tsv"             # key(ns|vmi) allocMi ns name node
 
@@ -132,7 +112,11 @@ joined="${tmpdir}/joined.tsv"
 
 echo "# Collecting VMI info (allocated memory + node)..." >&2
 
-oc get vmi -A -o json \
+if [[ -n "${NS_FILTER}" ]]; then
+  oc get vmi -n "${NS_FILTER}" -o json
+else
+  oc get vmi -A -o json
+fi \
   | jq -r '
       .items[]
       | select(.status.phase=="Running")
@@ -163,11 +147,11 @@ awk -F'\t' "${quantity_to_mi_awk}
 
 echo "# Collecting virt-launcher pod -> VMI mapping (ownerRefs/labels/fallback)..." >&2
 
-# Map pod -> VMI name:
-#  1) ownerReferences kind=VirtualMachineInstance (best)
-#  2) label kubevirt.io/domain
-#  3) heuristic from pod name
-oc get pod -A -l kubevirt.io=virt-launcher -o json \
+if [[ -n "${NS_FILTER}" ]]; then
+  oc get pod -n "${NS_FILTER}" -l kubevirt.io=virt-launcher -o json
+else
+  oc get pod -A -l kubevirt.io=virt-launcher -o json
+fi \
   | jq -r '
       .items[]
       | .metadata as $m
@@ -188,7 +172,7 @@ oc get pod -A -l kubevirt.io=virt-launcher -o json \
       {
         ns=$1; pod=$2; domain=$3; ownerVmi=$4;
 
-        # heuristic fallback from pod name
+        # last-resort heuristic from pod name
         hv=pod
         sub(/^virt-launcher-/, "", hv)
         sub(/-[^-]+$/, "", hv)
@@ -201,13 +185,12 @@ oc get pod -A -l kubevirt.io=virt-launcher -o json \
 
 echo "# Collecting memory usage from oc adm top pod..." >&2
 
-# Always create these files so later steps won't crash
 : > "${top_raw}"
 : > "${top_used_by_pod}"
 
-# Parse top output robustly; if it fails, proceed with empty metrics (METRICS=no)
+# IMPORTANT: always use -A so the header includes NAMESPACE; filter ns inside awk.
 if ! oc adm top pod -A --selector kubevirt.io=virt-launcher 2>/dev/null \
-  | awk '
+  | awk -v nsf="${NS_FILTER}" '
       NR==1 {
         for (i=1; i<=NF; i++) {
           if ($i=="NAMESPACE") nscol=i
@@ -222,6 +205,7 @@ if ! oc adm top pod -A --selector kubevirt.io=virt-launcher 2>/dev/null \
       }
       {
         ns=$nscol; pod=$namecol; mem=$memcol
+        if (nsf != "" && ns != nsf) next
         if (ns!="" && pod!="" && mem!="") print ns "\t" pod "\t" mem
       }
     ' > "${top_raw}"
@@ -239,7 +223,6 @@ awk -F'\t' "${quantity_to_mi_awk}
   }
 " "${top_raw}" > "${top_used_by_pod}"
 
-# Join pod->vmi with pod->usedMi => vmi->usedMi
 LC_ALL=C sort -t $'\t' -o "${podmap_raw}" "${podmap_raw}"
 LC_ALL=C sort -t $'\t' -o "${top_used_by_pod}" "${top_used_by_pod}"
 
@@ -256,7 +239,7 @@ join -t $'\t' -j 1 "${podmap_raw}" "${top_used_by_pod}" \
         if (vmi == "") next
         key = ns "|" vmi
 
-        # If multiple pods map to same VMI, keep max usage (safer default)
+        # If multiple pods map to same VMI, keep max usage
         if (!(key in max) || usedMi > max[key]) max[key]=usedMi
       }
       END {
@@ -264,12 +247,9 @@ join -t $'\t' -j 1 "${podmap_raw}" "${top_used_by_pod}" \
       }
     ' > "${pod_to_vmi_used}"
 
-# Join allocation + usage (keep alloc even if metrics missing)
 LC_ALL=C sort -t $'\t' -o "${vmi_alloc}" "${vmi_alloc}"
 LC_ALL=C sort -t $'\t' -o "${pod_to_vmi_used}" "${pod_to_vmi_used}"
 
-# vmi_alloc: key allocMi ns name node
-# pod_to_vmi_used: key usedMi hasMetrics
 join -t $'\t' -a 1 -e 0 -o '1.1 1.2 1.3 1.4 1.5 2.2 2.3' \
   "${vmi_alloc}" "${pod_to_vmi_used}" \
   | awk -F'\t' -v pct_thresh="${PCT_THRESH:-}" -v min_alloc="${MIN_ALLOC_GIB:-}" '
@@ -290,7 +270,7 @@ join -t $'\t' -a 1 -e 0 -o '1.1 1.2 1.3 1.4 1.5 2.2 2.3' \
 
         metrics = (has > 0 ? "yes" : "no")
 
-        printf "%-44s\t%-15s\t%-18s\t%8.2f\t%8.2f\t%8.2f\t%s\n",
+        printf "%s\t%s\t%s\t%8.2f\t%8.2f\t%8.2f\t%s\n",
                name, ns, node, allocGi, usedGi, pct, metrics
       }
     ' > "${joined}"
