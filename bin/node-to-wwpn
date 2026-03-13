@@ -1,79 +1,112 @@
 #!/usr/bin/env bash
 # node-to-wwpn
-# Show Fibre Channel WWPNs for OpenShift nodes.
-# If a node name is given, show only that node. If no node is given, list all nodes.
-# Usage:
-#   node-to-wwpn <node-name>
-#   node-to-wwpn             # list all nodes
-#   node-to-wwpn <node-name> --raw   # only WWPN values (no header / simpler output)
-
+# List Fibre Channel WWPNs for OpenShift worker nodes.
+# - By default queries all non-control/master nodes in parallel.
+# - If a node name is provided, only that node is queried.
+# - --raw prints node:wwpn in colon-separated byte format.
+# - --debug prints progress messages to stderr.
 set -euo pipefail
 
 progname=$(basename "$0")
 
+# Defaults
+PARALLEL=10
+RAW_MODE=0
+NODE_ARG=""
+DEBUG_MODE=0
+
 usage() {
   cat <<USAGE
 Usage:
-  $progname [<node-name>] [--raw]
+  $progname [<node-name>] [--raw] [--parallel N] [--debug]
 
-If <node-name> is omitted, the script will iterate all OpenShift nodes.
---raw prints only WWPNs (one per line) prefixed by node when multiple nodes are requested.
+If <node-name> is omitted the script will query all non-control/master nodes in parallel.
+--raw      Print node:wwpn in colon-separated byte format.
+--parallel N  Concurrency when querying all nodes (default: ${PARALLEL}).
+--debug    Print progress messages (to stderr) while nodes are being queried.
 
 Examples:
-  $progname worker-2.example.com
-  $progname              # query all nodes
-  $progname worker-2.example.com --raw
+  $progname
+  $progname --raw
+  $progname --parallel 20 --debug
+  $progname worker-02.example.com --raw
 USAGE
   exit 1
 }
 
-RAW=""
-NODE_ARG=""
-
-# Basic arg parsing
+# Parse args (simple)
 while (( $# )); do
   case "$1" in
     -h|--help) usage ;;
-    --raw) RAW="--raw"; shift ;;
-    *) 
+    --raw) RAW_MODE=1; shift ;;
+    --debug) DEBUG_MODE=1; shift ;;
+    --parallel)
+      shift
+      if [[ $# -eq 0 ]]; then echo "--parallel requires an argument" >&2; usage; fi
+      PARALLEL="$1"
+      if ! [[ "$PARALLEL" =~ ^[0-9]+$ ]]; then echo "Invalid parallel value: $PARALLEL" >&2; exit 2; fi
+      shift
+      ;;
+    --parallel=*)
+      PARALLEL="${1#*=}"
+      if ! [[ "$PARALLEL" =~ ^[0-9]+$ ]]; then echo "Invalid parallel value: $PARALLEL" >&2; exit 2; fi
+      shift
+      ;;
+    -*)
+      echo "Unknown option: $1" >&2; usage ;;
+    *)
       if [[ -z "$NODE_ARG" ]]; then
         NODE_ARG="$1"
       else
-        echo "Unknown argument: $1" >&2
-        usage
+        echo "Unknown argument: $1" >&2; usage
       fi
       shift
       ;;
   esac
 done
 
-# Remote script to run inside chroot /host on the node.
-# It will output rows with fields separated by tabs:
-# HOST(oc node name) <TAB> WWPN(port_name) <TAB> WWNN(node_name) <TAB> STATE <TAB> SPEED <TAB> PCI <TAB> DRIVER <TAB> SYMBOLIC_NAME
+timestamp() {
+  date "+%Y-%m-%d %H:%M:%S"
+}
+
+debug() {
+  if [[ "$DEBUG_MODE" -eq 1 ]]; then
+    # write to stderr so stdout remains pure tabular data
+    echo "$(timestamp) [DEBUG] $*" >&2
+  fi
+}
+
+# Remote script executed inside chroot /host on each node.
+# It prints tab-separated fields:
+# HOST<TAB>WWPN(port)<TAB>WWNN(node)<TAB>STATE<TAB>SPEED<TAB>PCI<TAB>DRIVER<TAB>SYMBOLIC_NAME
 read -r -d '' REMOTE_SCRIPT <<'EOF' || true
 #!/usr/bin/env bash
-# This runs on the node host filesystem (chroot /host)
-# Expect environment variable: OC_NODE_NAME set by the wrapper (OpenShift node name)
 OC_NODE_NAME="${OC_NODE_NAME:-unknown-node}"
 
-# Find fc host directories
+# Helper: strip leading 0x or 0X and normalize to lowercase
+strip_0x() {
+  local s="$1"
+  s="${s#0x}"
+  s="${s#0X}"
+  printf '%s' "${s,,}"
+}
+
 for h in /sys/class/fc_host/host*; do
   [ -d "$h" ] || continue
 
-  # read attributes (silently tolerate missing)
-  port_name=$(cat "$h/port_name" 2>/dev/null || echo "")
-  node_name=$(cat "$h/node_name" 2>/dev/null || echo "")
+  raw_port=$(cat "$h/port_name" 2>/dev/null || echo "")
+  raw_node=$(cat "$h/node_name" 2>/dev/null || echo "")
   port_state=$(cat "$h/port_state" 2>/dev/null || echo "")
   port_speed=$(cat "$h/port_speed" 2>/dev/null || echo "")
 
-  # driver and pci: walk from the fc_host to the underlying device
-  # (readlink -f to follow symlinks safely)
+  # strip 0x prefix if present and lowercase
+  port_name=$(strip_0x "$raw_port")
+  node_name=$(strip_0x "$raw_node")
+
   devpath=$(readlink -f "$h/device" 2>/dev/null || true)
-  # attempt to locate PCI device by walking up
   pci=""
   driver=""
   if [[ -n "$devpath" ]]; then
-    # find first ancestor containing a PCI address like 0000:00:17.0
     candidate="$devpath"
     while [[ "$candidate" != "/" && -z "$pci" ]]; do
       base=$(basename "$candidate")
@@ -84,15 +117,12 @@ for h in /sys/class/fc_host/host*; do
       candidate=$(dirname "$candidate")
     done
 
-    # driver name (if the device has a driver symlink)
     if [[ -e "$devpath/driver" ]]; then
       driver=$(basename "$(readlink -f "$devpath/driver")" 2>/dev/null || true)
     fi
   fi
 
-  # symbolic name: try to read the port_name in colon format or from device attributes if present
   symbolic=""
-  # Some drivers expose a 'symbolic_name' attribute; read if present
   if [[ -r "$h/symbolic_name" ]]; then
     symbolic=$(cat "$h/symbolic_name" 2>/dev/null || echo "")
   fi
@@ -109,51 +139,192 @@ for h in /sys/class/fc_host/host*; do
 done
 EOF
 
-# Function to query a single node and stream its output
-query_node() {
-  local node="$1"
-  local raw_flag="$2"
-
-  # Build oc debug command.
-  # We'll export OC_NODE_NAME before executing the remote here-doc so the remote has the OpenShift node name.
-  if [[ -n "$raw_flag" ]]; then
-    # raw: set RAW_MODE=1 to possibly let remote behave differently (not needed here but kept for compatibility)
-    oc debug "node/${node}" --quiet -- bash -c \
-      "chroot /host /bin/bash -s <<'INNERSH'
-export OC_NODE_NAME='${node}'
-export RAW_MODE=1
-${REMOTE_SCRIPT}
-INNERSH"
-  else
-    oc debug "node/${node}" --quiet -- bash -c \
-      "chroot /host /bin/bash -s <<'INNERSH'
-export OC_NODE_NAME='${node}'
-${REMOTE_SCRIPT}
-INNERSH"
+# Format WWPN into colon-separated bytes e.g. aa:bb:cc:dd:ee:ff:00:11
+format_colon() {
+  local w="$1"
+  # remove non-hex chars just in case, and lowercase
+  w="${w,,}"
+  w="${w//[^0-9a-f]/}"
+  # if odd length, pad with leading zero
+  if (( ${#w} % 2 == 1 )); then
+    w="0${w}"
   fi
+  # insert colon every two chars
+  local out=""
+  local i=0
+  while (( i < ${#w} )); do
+    if [[ -n "$out" ]]; then out="${out}:"; fi
+    out="${out}${w:i:2}"
+    i=$((i+2))
+  done
+  printf '%s' "$out"
 }
 
-# If a single node specified, only query that node; otherwise loop all nodes
-if [[ -n "${NODE_ARG}" ]]; then
-  # Just one node
-  if [[ -z "${RAW}" ]]; then
-    # Print header
-    printf 'HOST\tWWPN(port)\tWWNN(node)\tSTATE\tSPEED\tPCI\tDRIVER\tSYMBOLIC_NAME\n'
+# Query a node: returns stdout with tab-separated rows, or prints error to stderr and returns non-zero
+query_node() {
+  local node="$1"
+  local tmp
+  tmp=$(mktemp)
+  # Run oc debug and capture both stdout and stderr
+  if ! oc debug "node/${node}" --quiet -- bash -c \
+    "chroot /host /bin/bash -s <<'INNERSH'
+export OC_NODE_NAME='${node}'
+${REMOTE_SCRIPT}
+INNERSH" >"${tmp}" 2> "${tmp}.err"; then
+    echo "error: unable to create debug pod for '${node}'" >&2
+    if [[ -s "${tmp}.err" ]]; then
+      # print a short excerpt from oc debug stderr to help debugging
+      echo "oc debug output for ${node} (first lines):" >&2
+      sed -n '1,200p' "${tmp}.err" >&2 || true
+    fi
+    rm -f "${tmp}" "${tmp}.err"
+    return 1
   fi
-  query_node "${NODE_ARG}" "${RAW}"
+
+  # combine stdout (which contains the tab-separated rows)
+  cat "${tmp}"
+  rm -f "${tmp}" "${tmp}.err"
+  return 0
+}
+
+# Get node list:
+get_target_nodes() {
+  if [[ -n "$NODE_ARG" ]]; then
+    printf '%s\n' "$NODE_ARG"
+    return 0
+  fi
+
+  # Prefer nodes labeled as worker if present; fallback to selecting nodes that do NOT have master/control-plane label.
+  nodes=$(oc get nodes --selector='node-role.kubernetes.io/worker' -o jsonpath='{range .items[*]}{.metadata.name}{"\n"}{end}' 2>/dev/null || true)
+  if [[ -n "$nodes" ]]; then
+    printf '%s\n' "$nodes"
+    return 0
+  fi
+
+  nodes=$(oc get nodes --selector='!node-role.kubernetes.io/master,!node-role.kubernetes.io/control-plane' -o jsonpath='{range .items[*]}{.metadata.name}{"\n"}{end}' 2>/dev/null || true)
+  if [[ -n "$nodes" ]]; then
+    printf '%s\n' "$nodes"
+    return 0
+  fi
+
+  oc get nodes -o jsonpath='{range .items[*]}{.metadata.name}{"\n"}{end}'
+}
+
+# SHORT-CIRCUIT: single node & RAW
+if [[ -n "$NODE_ARG" && "$RAW_MODE" -eq 1 ]]; then
+  debug "Querying single node (raw): $NODE_ARG"
+  if ! output=$(query_node "$NODE_ARG"); then
+    exit 1
+  fi
+  while IFS=$'\t' read -r host wwpn rest; do
+    [[ -z "$wwpn" ]] && continue
+    fmt=$(format_colon "$wwpn")
+    printf '%s:%s\n' "$host" "$fmt"
+  done <<< "$output"
   exit 0
 fi
 
-# No node specified: query all nodes
-# Get the node list in a stable way
-nodes=$(oc get nodes -o jsonpath='{range .items[*]}{.metadata.name}{"\n"}{end}')
-
-if [[ -z "${RAW}" ]]; then
-  printf 'HOST\tWWPN(port)\tWWNN(node)\tSTATE\tSPEED\tPCI\tDRIVER\tSYMBOLIC_NAME\n'
+# SINGLE node & NOT RAW: header + aligned output
+if [[ -n "$NODE_ARG" && "$RAW_MODE" -eq 0 ]]; then
+  debug "Querying single node: $NODE_ARG"
+  if ! output=$(query_node "$NODE_ARG"); then
+    exit 1
+  fi
+  {
+    printf 'HOST\tWWPN(port)\tWWNN(node)\tSTATE\tSPEED\tPCI\tDRIVER\tSYMBOLIC_NAME\n'
+    echo "$output"
+  } | column -t -s $'\t'
+  exit 0
 fi
 
-# Iterate nodes and print their entries. If multiple nodes, keep results combined.
+# MULTI-node path (parallel by default)
+nodes_list=()
 while IFS= read -r n; do
   [[ -z "$n" ]] && continue
-  query_node "$n" "$RAW"
-done <<< "$nodes"
+  nodes_list+=("$n")
+done < <(get_target_nodes)
+
+if [[ ${#nodes_list[@]} -eq 0 ]]; then
+  echo "No target nodes found." >&2
+  exit 2
+fi
+
+# Temp dir to collect per-node outputs
+TMPDIR=$(mktemp -d)
+trap 'rm -rf "$TMPDIR"' EXIT
+
+# Function to run query for one node and save into tmp file (used by background jobs)
+run_and_save() {
+  local nod="$1"
+  local outf="$2"
+  debug "Starting query for ${nod}"
+  if query_node "$nod" > "$outf" 2> "${outf}.err"; then
+    debug "Finished query for ${nod}"
+  else
+    debug "Failed query for ${nod} (see ${outf}.err)"
+    printf '#ERROR\t%s\n' "$nod" > "${outf}.failed"
+    # trim oc debug stderr to a tail file for inspection
+    if [[ -s "${outf}.err" ]]; then
+      head -n 200 "${outf}.err" > "${outf}.err.tail" || true
+      rm -f "${outf}.err"
+    fi
+  fi
+}
+
+# Launch jobs up to PARALLEL
+for n in "${nodes_list[@]}"; do
+  outf="${TMPDIR}/${n}.out"
+  # throttle: wait while there are >= PARALLEL running jobs
+  while (( $(jobs -rp | wc -l) >= PARALLEL )); do
+    sleep 0.05
+  done
+  # start background
+  run_and_save "$n" "$outf" &
+done
+
+# Wait for all background jobs
+wait
+
+# Output
+if [[ "$RAW_MODE" -eq 1 ]]; then
+  for n in "${nodes_list[@]}"; do
+    outf="${TMPDIR}/${n}.out"
+    if [[ -f "${outf}.failed" ]]; then
+      echo "error: failed to query ${n}" >&2
+      if [[ -f "${outf}.err.tail" ]]; then
+        echo "oc debug stderr for ${n} (trimmed):" >&2
+        sed -n '1,200p' "${outf}.err.tail" >&2
+      fi
+      continue
+    fi
+    if [[ -f "$outf" ]]; then
+      while IFS=$'\t' read -r host wwpn rest; do
+        [[ -z "$wwpn" ]] && continue
+        fmt=$(format_colon "$wwpn")
+        printf '%s:%s\n' "$host" "$fmt"
+      done < "$outf"
+    fi
+  done
+  exit 0
+fi
+
+# Non-raw: print header and aligned table combining all outputs.
+{
+  printf 'HOST\tWWPN(port)\tWWNN(node)\tSTATE\tSPEED\tPCI\tDRIVER\tSYMBOLIC_NAME\n'
+  for n in "${nodes_list[@]}"; do
+    outf="${TMPDIR}/${n}.out"
+    if [[ -f "${outf}.failed" ]]; then
+      echo "## ERROR: failed to query ${n}" >&2
+      if [[ -f "${outf}.err.tail" ]]; then
+        echo "## oc debug stderr for ${n} (trimmed):" >&2
+        sed -n '1,200p' "${outf}.err.tail" >&2
+      fi
+      continue
+    fi
+    if [[ -f "$outf" ]]; then
+      cat "$outf"
+    fi
+  done
+} | column -t -s $'\t'
+
+exit 0
