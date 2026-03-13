@@ -4,16 +4,19 @@
 # - By default queries all non-control/master nodes in parallel.
 # - If a node name is provided, only that node is queried.
 # - --raw prints node:wwpn in colon-separated byte format.
-# - --debug prints progress messages to stderr.
+# - Progress summary printed to stderr while querying many nodes.
 set -euo pipefail
 
 progname=$(basename "$0")
 
 # Defaults
-PARALLEL=10
+PARALLEL=25
 RAW_MODE=0
 NODE_ARG=""
 DEBUG_MODE=0
+RETRIES=2        # number of retries (in addition to the initial attempt)
+BACKOFF_BASE=2   # backoff base seconds (exponential: 2,4,...)
+PROGRESS_INTERVAL=2  # seconds between progress updates
 
 usage() {
   cat <<USAGE
@@ -23,7 +26,7 @@ Usage:
 If <node-name> is omitted the script will query all non-control/master nodes in parallel.
 --raw      Print node:wwpn in colon-separated byte format.
 --parallel N  Concurrency when querying all nodes (default: ${PARALLEL}).
---debug    Print progress messages (to stderr) while nodes are being queried.
+--debug    Print extra debug messages (to stderr) while nodes are being queried.
 
 Examples:
   $progname
@@ -65,15 +68,17 @@ while (( $# )); do
   esac
 done
 
-timestamp() {
-  date "+%Y-%m-%d %H:%M:%S"
-}
+timestamp() { date "+%Y-%m-%d %H:%M:%S"; }
 
 debug() {
   if [[ "$DEBUG_MODE" -eq 1 ]]; then
-    # write to stderr so stdout remains pure tabular data
     echo "$(timestamp) [DEBUG] $*" >&2
   fi
+}
+
+progress() {
+  # print a short progress summary (always on stderr)
+  echo "$(timestamp) [PROGRESS] $*" >&2
 }
 
 # Remote script executed inside chroot /host on each node.
@@ -142,16 +147,10 @@ EOF
 # Format WWPN into colon-separated bytes e.g. aa:bb:cc:dd:ee:ff:00:11
 format_colon() {
   local w="$1"
-  # remove non-hex chars just in case, and lowercase
   w="${w,,}"
   w="${w//[^0-9a-f]/}"
-  # if odd length, pad with leading zero
-  if (( ${#w} % 2 == 1 )); then
-    w="0${w}"
-  fi
-  # insert colon every two chars
-  local out=""
-  local i=0
+  if (( ${#w} % 2 == 1 )); then w="0${w}"; fi
+  local out=""; local i=0
   while (( i < ${#w} )); do
     if [[ -n "$out" ]]; then out="${out}:"; fi
     out="${out}${w:i:2}"
@@ -160,31 +159,51 @@ format_colon() {
   printf '%s' "$out"
 }
 
-# Query a node: returns stdout with tab-separated rows, or prints error to stderr and returns non-zero
-query_node() {
+# A single attempt to query a node (no retries). Returns 0 on success, non-zero on failure.
+_oc_debug_once() {
   local node="$1"
-  local tmp
-  tmp=$(mktemp)
-  # Run oc debug and capture both stdout and stderr
-  if ! oc debug "node/${node}" --quiet -- bash -c \
+  local outpath="$2"
+  # capture stdout/stderr separately
+  if oc debug "node/${node}" --quiet -- bash -c \
     "chroot /host /bin/bash -s <<'INNERSH'
 export OC_NODE_NAME='${node}'
 ${REMOTE_SCRIPT}
-INNERSH" >"${tmp}" 2> "${tmp}.err"; then
-    echo "error: unable to create debug pod for '${node}'" >&2
-    if [[ -s "${tmp}.err" ]]; then
-      # print a short excerpt from oc debug stderr to help debugging
-      echo "oc debug output for ${node} (first lines):" >&2
-      sed -n '1,200p' "${tmp}.err" >&2 || true
-    fi
-    rm -f "${tmp}" "${tmp}.err"
+INNERSH" >"${outpath}" 2> "${outpath}.err"; then
+    return 0
+  else
     return 1
   fi
+}
 
-  # combine stdout (which contains the tab-separated rows)
-  cat "${tmp}"
-  rm -f "${tmp}" "${tmp}.err"
-  return 0
+# Query node with retries and exponential backoff.
+# Writes successful stdout to outpath, or leaves outpath.failed and .err.tail on failure.
+query_node_with_retries() {
+  local node="$1"; local outpath="$2"
+  local attempt=0
+  local max_attempts=$((RETRIES + 1))
+  while (( attempt < max_attempts )); do
+    attempt=$((attempt+1))
+    debug "Node ${node}: attempt ${attempt}/${max_attempts}"
+    if _oc_debug_once "$node" "$outpath"; then
+      debug "Node ${node}: success on attempt ${attempt}"
+      return 0
+    fi
+    # failed
+    debug "Node ${node}: failure on attempt ${attempt}"
+    if (( attempt < max_attempts )); then
+      sleep_secs=$(( BACKOFF_BASE * (2 ** (attempt-1)) ))
+      debug "Node ${node}: sleeping ${sleep_secs}s before retry"
+      sleep "$sleep_secs"
+    fi
+  done
+
+  # after attempts exhausted: mark failed and preserve trimmed stderr
+  echo "error: unable to create debug pod for '${node}' (after ${max_attempts} attempts)" > "${outpath}.failed.msg"
+  if [[ -s "${outpath}.err" ]]; then
+    head -n 200 "${outpath}.err" > "${outpath}.err.tail" || true
+    rm -f "${outpath}.err"
+  fi
+  return 1
 }
 
 # Get node list:
@@ -194,18 +213,11 @@ get_target_nodes() {
     return 0
   fi
 
-  # Prefer nodes labeled as worker if present; fallback to selecting nodes that do NOT have master/control-plane label.
   nodes=$(oc get nodes --selector='node-role.kubernetes.io/worker' -o jsonpath='{range .items[*]}{.metadata.name}{"\n"}{end}' 2>/dev/null || true)
-  if [[ -n "$nodes" ]]; then
-    printf '%s\n' "$nodes"
-    return 0
-  fi
+  if [[ -n "$nodes" ]]; then printf '%s\n' "$nodes"; return 0; fi
 
   nodes=$(oc get nodes --selector='!node-role.kubernetes.io/master,!node-role.kubernetes.io/control-plane' -o jsonpath='{range .items[*]}{.metadata.name}{"\n"}{end}' 2>/dev/null || true)
-  if [[ -n "$nodes" ]]; then
-    printf '%s\n' "$nodes"
-    return 0
-  fi
+  if [[ -n "$nodes" ]]; then printf '%s\n' "$nodes"; return 0; fi
 
   oc get nodes -o jsonpath='{range .items[*]}{.metadata.name}{"\n"}{end}'
 }
@@ -213,31 +225,49 @@ get_target_nodes() {
 # SHORT-CIRCUIT: single node & RAW
 if [[ -n "$NODE_ARG" && "$RAW_MODE" -eq 1 ]]; then
   debug "Querying single node (raw): $NODE_ARG"
-  if ! output=$(query_node "$NODE_ARG"); then
+  tmpf=$(mktemp)
+  if query_node_with_retries "$NODE_ARG" "$tmpf"; then
+    while IFS=$'\t' read -r host wwpn rest; do
+      [[ -z "$wwpn" ]] && continue
+      fmt=$(format_colon "$wwpn")
+      printf '%s:%s\n' "$host" "$fmt"
+    done < "$tmpf"
+    rm -f "$tmpf" "${tmpf}.err" "${tmpf}.err.tail" "${tmpf}.failed.msg"
+    exit 0
+  else
+    # print failure info
+    if [[ -f "${tmpf}.failed.msg" ]]; then
+      cat "${tmpf}.failed.msg" >&2
+    fi
+    if [[ -f "${tmpf}.err.tail" ]]; then
+      echo "oc debug stderr (trimmed):" >&2
+      sed -n '1,200p' "${tmpf}.err.tail" >&2
+    fi
+    rm -f "$tmpf" "${tmpf}.err" "${tmpf}.err.tail" "${tmpf}.failed.msg"
     exit 1
   fi
-  while IFS=$'\t' read -r host wwpn rest; do
-    [[ -z "$wwpn" ]] && continue
-    fmt=$(format_colon "$wwpn")
-    printf '%s:%s\n' "$host" "$fmt"
-  done <<< "$output"
-  exit 0
 fi
 
 # SINGLE node & NOT RAW: header + aligned output
 if [[ -n "$NODE_ARG" && "$RAW_MODE" -eq 0 ]]; then
   debug "Querying single node: $NODE_ARG"
-  if ! output=$(query_node "$NODE_ARG"); then
+  tmpf=$(mktemp)
+  if query_node_with_retries "$NODE_ARG" "$tmpf"; then
+    {
+      printf 'HOST\tWWPN(port)\tWWNN(node)\tSTATE\tSPEED\tPCI\tDRIVER\tSYMBOLIC_NAME\n'
+      cat "$tmpf"
+    } | column -t -s $'\t'
+    rm -f "$tmpf" "${tmpf}.err" "${tmpf}.err.tail" "${tmpf}.failed.msg"
+    exit 0
+  else
+    if [[ -f "${tmpf}.failed.msg" ]]; then cat "${tmpf}.failed.msg" >&2; fi
+    if [[ -f "${tmpf}.err.tail" ]]; then echo "oc debug stderr (trimmed):" >&2; sed -n '1,200p' "${tmpf}.err.tail" >&2; fi
+    rm -f "$tmpf" "${tmpf}.err" "${tmpf}.err.tail" "${tmpf}.failed.msg"
     exit 1
   fi
-  {
-    printf 'HOST\tWWPN(port)\tWWNN(node)\tSTATE\tSPEED\tPCI\tDRIVER\tSYMBOLIC_NAME\n'
-    echo "$output"
-  } | column -t -s $'\t'
-  exit 0
 fi
 
-# MULTI-node path (parallel by default)
+# MULTI-node path (parallel)
 nodes_list=()
 while IFS= read -r n; do
   [[ -z "$n" ]] && continue
@@ -245,56 +275,74 @@ while IFS= read -r n; do
 done < <(get_target_nodes)
 
 if [[ ${#nodes_list[@]} -eq 0 ]]; then
-  echo "No target nodes found." >&2
-  exit 2
+  echo "No target nodes found." >&2; exit 2
 fi
 
-# Temp dir to collect per-node outputs
 TMPDIR=$(mktemp -d)
 trap 'rm -rf "$TMPDIR"' EXIT
 
-# Function to run query for one node and save into tmp file (used by background jobs)
+# run_and_save invoked in background for each node
 run_and_save() {
-  local nod="$1"
-  local outf="$2"
-  debug "Starting query for ${nod}"
-  if query_node "$nod" > "$outf" 2> "${outf}.err"; then
-    debug "Finished query for ${nod}"
+  local nod="$1"; local outf="$2"
+  progress "Starting ${nod}"
+  if query_node_with_retries "$nod" "$outf"; then
+    # success: mark done
+    touch "${outf}.done"
+    progress "Completed ${nod}"
   else
-    debug "Failed query for ${nod} (see ${outf}.err)"
-    printf '#ERROR\t%s\n' "$nod" > "${outf}.failed"
-    # trim oc debug stderr to a tail file for inspection
-    if [[ -s "${outf}.err" ]]; then
-      head -n 200 "${outf}.err" > "${outf}.err.tail" || true
-      rm -f "${outf}.err"
-    fi
+    touch "${outf}.failed"
+    progress "Failed ${nod}"
   fi
 }
 
-# Launch jobs up to PARALLEL
+# Start monitor that prints Progress: X/Y every PROGRESS_INTERVAL seconds.
+monitor_pid=""
+start_monitor() {
+  local total="$1"
+  (
+    while :; do
+      completed=$(find "$TMPDIR" -name '*.done' 2>/dev/null | wc -l)
+      failed=$(find "$TMPDIR" -name '*.failed' 2>/dev/null | wc -l)
+      inprogress=$(( total - completed - failed ))
+      progress "Progress: ${completed}/${total} completed, ${failed} failed, ${inprogress} in-progress"
+      # exit when all nodes accounted for
+      if (( completed + failed >= total )); then
+        break
+      fi
+      sleep "$PROGRESS_INTERVAL"
+    done
+  ) &
+  monitor_pid=$!
+}
+
+# Launch background jobs up to PARALLEL
+start_monitor "${#nodes_list[@]}"
+
 for n in "${nodes_list[@]}"; do
   outf="${TMPDIR}/${n}.out"
   # throttle: wait while there are >= PARALLEL running jobs
   while (( $(jobs -rp | wc -l) >= PARALLEL )); do
     sleep 0.05
   done
-  # start background
   run_and_save "$n" "$outf" &
 done
 
-# Wait for all background jobs
+# Wait for jobs
 wait
 
-# Output
+# Ensure monitor finished
+if [[ -n "$monitor_pid" ]]; then
+  wait "$monitor_pid" 2>/dev/null || true
+fi
+
+# Final output
 if [[ "$RAW_MODE" -eq 1 ]]; then
   for n in "${nodes_list[@]}"; do
     outf="${TMPDIR}/${n}.out"
     if [[ -f "${outf}.failed" ]]; then
       echo "error: failed to query ${n}" >&2
-      if [[ -f "${outf}.err.tail" ]]; then
-        echo "oc debug stderr for ${n} (trimmed):" >&2
-        sed -n '1,200p' "${outf}.err.tail" >&2
-      fi
+      if [[ -f "${outf}.failed.msg" ]]; then sed -n '1,200p' "${outf}.failed.msg" >&2; fi
+      if [[ -f "${outf}.err.tail" ]]; then echo "oc debug stderr for ${n} (trimmed):" >&2; sed -n '1,200p' "${outf}.err.tail" >&2; fi
       continue
     fi
     if [[ -f "$outf" ]]; then
@@ -308,17 +356,15 @@ if [[ "$RAW_MODE" -eq 1 ]]; then
   exit 0
 fi
 
-# Non-raw: print header and aligned table combining all outputs.
+# Non-raw: print header and aligned table combining all successful outputs.
 {
   printf 'HOST\tWWPN(port)\tWWNN(node)\tSTATE\tSPEED\tPCI\tDRIVER\tSYMBOLIC_NAME\n'
   for n in "${nodes_list[@]}"; do
     outf="${TMPDIR}/${n}.out"
     if [[ -f "${outf}.failed" ]]; then
       echo "## ERROR: failed to query ${n}" >&2
-      if [[ -f "${outf}.err.tail" ]]; then
-        echo "## oc debug stderr for ${n} (trimmed):" >&2
-        sed -n '1,200p' "${outf}.err.tail" >&2
-      fi
+      if [[ -f "${outf}.failed.msg" ]]; then sed -n '1,200p' "${outf}.failed.msg" >&2; fi
+      if [[ -f "${outf}.err.tail" ]]; then echo "## oc debug stderr for ${n} (trimmed):" >&2; sed -n '1,200p' "${outf}.err.tail" >&2; fi
       continue
     fi
     if [[ -f "$outf" ]]; then
@@ -326,5 +372,10 @@ fi
     fi
   done
 } | column -t -s $'\t'
+
+# Final summary
+completed=$(find "$TMPDIR" -name '*.done' 2>/dev/null | wc -l || true)
+failed=$(find "$TMPDIR" -name '*.failed' 2>/dev/null | wc -l || true)
+progress "Finished: ${completed} succeeded, ${failed} failed."
 
 exit 0
