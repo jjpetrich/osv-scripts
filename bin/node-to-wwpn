@@ -164,7 +164,7 @@ _oc_debug_once() {
   local node="$1"
   local outpath="$2"
   # capture stdout/stderr separately
-  if oc debug "node/${node}" --quiet -- bash -c \
+  if oc debug -T "node/${node}" --quiet -- bash -c \
     "chroot /host /bin/bash -s <<'INNERSH'
 export OC_NODE_NAME='${node}'
 ${REMOTE_SCRIPT}
