@@ -6,7 +6,7 @@ VERSION="v4.2.0"
 
 print_help() {
   cat <<'HELP'
-showclusterinfo
+showclusterinfo (sci)
 Report requested (BOOKED) vs allocatable vs live usage per node, with optional
 debug listing of per-pod Requests / Limits / Usage. Includes node STATUS
 next to node name and supports node-scoped views.
@@ -61,11 +61,11 @@ NOTES
   * Colors are only applied when live usage is present (has metrics).
 
 EXAMPLES
-  showclusterinfo
-  showclusterinfo --vm-only -n byu-chemistry
-  showclusterinfo --vm-only --debug --show-limits --show-usage --show-cpu
-  showclusterinfo --show-node-capacity --show-usage --show-cpu
-  showclusterinfo --debug --node radium04.byu.edu --node-scope-main
+  sci
+  sci --vm-only -n byu-chemistry
+  sci --vm-only --debug --show-limits --show-usage --show-cpu
+  sci --show-node-capacity --show-usage --show-cpu
+  sci --debug --node radium04.byu.edu --node-scope-main
 HELP
 }
 
