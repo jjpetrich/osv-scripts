@@ -228,6 +228,20 @@ if [[ -n "$NODE_FILTER" ]]; then
   NODE_SCOPE_MAIN=1
 fi
 
+# When node filter is used, prefer using the main --sort-col to sort the per-pod debug list.
+# Map node-level sort columns into per-pod debug columns where sensible.
+if [[ -n "$NODE_FILTER" ]]; then
+  case "$SORT_COLUMN" in
+    BOOKEDGI|BOOKED% ) DEBUG_SORT_COLUMN="REQ_MEM" ;;
+    USAGEGI|USED%    ) DEBUG_SORT_COLUMN="USAGE_MEM" ;;
+    CPU_BOOK|CPU_BOOKED% ) DEBUG_SORT_COLUMN="REQ_CPU" ;;
+    CPU_USE|CPU_USED%    ) DEBUG_SORT_COLUMN="USAGE_CPU" ;;
+    NODE|STATUS|ROLES   ) DEBUG_SORT_COLUMN="NAME" ;;
+    *) # leave DEBUG_SORT_COLUMN as previously set (default NAME)
+      ;;
+  esac
+fi
+
 # ------------------------ SANITY CHECKS ------------------------
 command -v oc >/dev/null 2>&1 || { echo "oc not found in PATH"; exit 1; }
 command -v jq >/dev/null 2>&1 || { echo "jq not found in PATH"; exit 1; }
